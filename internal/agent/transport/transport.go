@@ -11,6 +11,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/vmihailenco/msgpack/v5"
+
 	agentcfg "github.com/gleicon/fiia/internal/agent/config"
 	"github.com/gleicon/fiia/internal/agent/queue"
 	"github.com/gleicon/fiia/internal/wire"
@@ -80,15 +82,15 @@ func New(cfg *agentcfg.AgentConfig) (*Transport, error) {
 
 // SendHeartbeat signs and transmits a heartbeat payload via the queue.
 // Writes frame to queue first, then drains all queued entries.
-// Returns false on failure — caller uses this to drive backoff.
-func (t *Transport) SendHeartbeat(p wire.HeartbeatPayload) bool {
+// Returns (false, nil) on failure; (true, cmd) when hub delivered a command.
+func (t *Transport) SendHeartbeat(p wire.HeartbeatPayload) (bool, *wire.CommandPayload) {
 	assert(t.tls_cfg != nil, "tls_cfg must not be nil")
 	assert(p.NodeID != "", "heartbeat node_id must not be empty")
 
 	payload_bytes, err := wire.EncodeHeartbeat(p)
 	if err != nil {
 		log.Printf("transport: encode heartbeat: %v", err)
-		return false
+		return false, nil
 	}
 	frame := wire.BuildFrame(t.cfg.HMACSecret, payload_bytes)
 
@@ -96,15 +98,16 @@ func (t *Transport) SendHeartbeat(p wire.HeartbeatPayload) bool {
 		if err := t.q.Write(frame); err != nil {
 			log.Printf("transport: queue heartbeat: %v — falling back to direct send", err)
 		} else {
-			return t.drainQueue()
+			ok, cmd := t.drainQueue()
+			return ok, cmd
 		}
 	}
 
 	if err := t.sendFrame(frame); err != nil {
 		log.Printf("transport: send heartbeat: %v", err)
-		return false
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
 // SendAuditResult signs and queues a drift payload for delivery on the next heartbeat drain.
@@ -133,15 +136,17 @@ func (t *Transport) SendAuditResult(p wire.DriftPayload) {
 }
 
 // drainQueue sends all queued frames in FIFO order, advancing the queue on
-// each successful send. Stops and returns false on the first failure.
-func (t *Transport) drainQueue() bool {
+// each successful send. Returns the first command received from any heartbeat ACK.
+func (t *Transport) drainQueue() (bool, *wire.CommandPayload) {
 	assert(t.q != nil, "drainQueue called without queue")
+
+	var received_cmd *wire.CommandPayload
 
 	for t.q.Len() > 0 {
 		frame, ok, err := t.q.Peek()
 		if err != nil || !ok {
 			log.Printf("transport: peek queue: %v", err)
-			return false
+			return false, nil
 		}
 		assert(len(frame) > 0, "peeked frame must not be empty")
 
@@ -150,34 +155,37 @@ func (t *Transport) drainQueue() bool {
 			log.Printf("transport: corrupt queued frame, skipping: %v", err)
 			if aerr := t.q.Advance(); aerr != nil {
 				log.Printf("transport: advance past corrupt frame: %v", aerr)
-				return false
+				return false, nil
 			}
 			continue
 		}
 
 		if ptype == wire.PayloadTypeHeartbeat {
-			acked, serr := t.sendFrameExpectAck(frame)
+			acked, cmd, serr := t.sendFrameExpectAck(frame)
 			if serr != nil {
 				log.Printf("transport: send queued heartbeat: %v", serr)
-				return false
+				return false, nil
 			}
 			if !acked {
-				log.Printf("transport: heartbeat sent but no ACK received — retrying next cycle")
-				return false
+				log.Printf("transport: heartbeat sent but no ACK — retrying next cycle")
+				return false, nil
+			}
+			if cmd != nil && received_cmd == nil {
+				received_cmd = cmd
 			}
 		} else {
 			if serr := t.sendFrame(frame); serr != nil {
 				log.Printf("transport: send queued frame (type=%d): %v", ptype, serr)
-				return false
+				return false, nil
 			}
 		}
 
 		if aerr := t.q.Advance(); aerr != nil {
 			log.Printf("transport: advance queue: %v", aerr)
-			return false
+			return false, nil
 		}
 	}
-	return true
+	return true, received_cmd
 }
 
 func (t *Transport) openConn() (net.Conn, error) {
@@ -217,42 +225,65 @@ func (t *Transport) sendFrame(frame []byte) error {
 	return t.writeFrame(conn, frame)
 }
 
-// sendFrameExpectAck sends frame and reads one optional ACK response.
-// Returns (true, nil) on ACK received, (false, nil) on timeout/no-ACK, (false, err) on send error.
-func (t *Transport) sendFrameExpectAck(frame []byte) (bool, error) {
+// sendFrameExpectAck sends frame and reads one optional response.
+// Returns (true, cmd, nil) on success, (false, nil, nil) on timeout/no-ACK, (false, nil, err) on send error.
+func (t *Transport) sendFrameExpectAck(frame []byte) (bool, *wire.CommandPayload, error) {
 	conn, err := t.openConn()
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	defer conn.Close()
 
 	if err := t.writeFrame(conn, frame); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
-	acked := readAck(conn)
-	assert(conn != nil, "conn must not be nil after ACK read")
-	return acked, nil
+	acked, cmd := readResponse(conn)
+	assert(conn != nil, "conn must not be nil after response read")
+	return acked, cmd, nil
 }
 
-// readAck reads a 5-byte ACK frame from conn with a short timeout.
-// Returns true only if the frame is a valid PayloadTypeAck.
-func readAck(conn net.Conn) bool {
+// readResponse reads a hub→agent response frame.
+// Returns (true, nil) for a simple ACK, (true, cmd) for a command, (false, nil) on error/timeout.
+func readResponse(conn net.Conn) (bool, *wire.CommandPayload) {
 	assert(conn != nil, "conn must not be nil")
 
 	if err := conn.SetReadDeadline(time.Now().Add(ack_read_timeout)); err != nil {
-		return false
+		return false, nil
 	}
-	var buf [wire.FrameHeaderSize + 1]byte
-	if _, err := io.ReadFull(conn, buf[:]); err != nil {
-		return false
+
+	var header [wire.FrameHeaderSize]byte
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		return false, nil
 	}
-	body_len := binary.BigEndian.Uint32(buf[:wire.FrameHeaderSize])
-	return body_len == 1 && buf[wire.FrameHeaderSize] == wire.PayloadTypeAck
+
+	body_len := binary.BigEndian.Uint32(header[:])
+	if body_len == 0 || body_len > 1<<16 {
+		return false, nil
+	}
+
+	body := make([]byte, body_len)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return false, nil
+	}
+
+	// Simple ACK: body is exactly one byte = PayloadTypeAck
+	if body_len == 1 && body[0] == wire.PayloadTypeAck {
+		return true, nil
+	}
+
+	// Attempt to decode as CommandPayload
+	var cmd wire.CommandPayload
+	if err := msgpack.Unmarshal(body, &cmd); err != nil {
+		return true, nil // unrecognized but hub did respond — treat as ACK
+	}
+	if cmd.PayloadType == wire.PayloadTypeCommand && cmd.Command != "" {
+		return true, &cmd
+	}
+	return true, nil
 }
 
 // peekFrameType extracts the payload type from a complete wire frame.
-// frame must include the 4-byte length header and trailing HMAC.
 func peekFrameType(frame []byte) (uint8, error) {
 	assert(len(frame) > 0, "frame must not be empty")
 

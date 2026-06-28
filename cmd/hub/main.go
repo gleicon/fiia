@@ -16,6 +16,7 @@ import (
 
 	hubapi "github.com/gleicon/fiia/internal/hub/api"
 	hubcfg "github.com/gleicon/fiia/internal/hub/config"
+	"github.com/gleicon/fiia/internal/hub/command"
 	"github.com/gleicon/fiia/internal/hub/ingest"
 	"github.com/gleicon/fiia/internal/hub/inventory"
 	"github.com/gleicon/fiia/internal/hub/metrics"
@@ -71,10 +72,11 @@ func main() {
 	}
 
 	var drift_counter atomic.Int64
+	cmdq := command.New()
 	metrics_srv := metrics.New(reg, db, &drift_counter,
 		prometheus.DefaultRegisterer, prometheus.DefaultGatherer)
-	api_srv := hubapi.New(db)
-	ingest_l := ingest.New(tls_cfg, reg, db, &drift_counter)
+	api_srv := hubapi.New(db, cmdq)
+	ingest_l := ingest.New(tls_cfg, reg, db, &drift_counter, cmdq)
 
 	stop_ch := make(chan struct{})
 

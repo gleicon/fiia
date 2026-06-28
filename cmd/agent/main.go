@@ -41,10 +41,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	audit_now_ch := make(chan struct{}, 1)
+
 	sdnotify.Notify("READY=1")
 	log.Printf("agent: started (node_id=%s)", cfg.NodeID)
 
-	go heartbeat.Run(ctx, cfg, tr)
+	go heartbeat.Run(ctx, cfg, tr, audit_now_ch, cancel)
 
 	if cfg.AnsiblePlaybookPath != "" {
 		if err := audit.Probe(cfg); err != nil {
@@ -55,7 +57,7 @@ func main() {
 				Status:        "AUDIT_ERROR",
 			})
 		} else {
-			go runAuditLoop(ctx, cfg, tr)
+			go runAuditLoop(ctx, cfg, tr, audit_now_ch)
 		}
 	}
 
@@ -67,7 +69,7 @@ func main() {
 	cancel()
 }
 
-func runAuditLoop(ctx context.Context, cfg *agentcfg.AgentConfig, tr *transport.Transport) {
+func runAuditLoop(ctx context.Context, cfg *agentcfg.AgentConfig, tr *transport.Transport, audit_now_ch <-chan struct{}) {
 	for {
 		base_sec := cfg.AuditIntervalSec
 		jitter_sec := rand.IntN(cfg.AuditJitterMaxSec + 1)
@@ -76,6 +78,8 @@ func runAuditLoop(ctx context.Context, cfg *agentcfg.AgentConfig, tr *transport.
 		select {
 		case <-ctx.Done():
 			return
+		case <-audit_now_ch:
+			log.Printf("agent: audit_now command received — running immediate audit")
 		case <-time.After(sleep_duration):
 		}
 

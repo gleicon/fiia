@@ -190,6 +190,36 @@ func PeekPayloadType(data []byte) (uint8, error) {
 	return peek.PayloadType, nil
 }
 
+// CommandPayload carries a hub→agent command delivered as the heartbeat ACK response.
+// PlaybookPath and IntervalSec are only set for "config_update" commands.
+type CommandPayload struct {
+	SchemaVersion uint8  `msgpack:"schema_version"`
+	PayloadType   uint8  `msgpack:"payload_type"` // PayloadTypeCommand
+	Command       string `msgpack:"command"`
+	PlaybookPath  string `msgpack:"playbook_path,omitempty"`
+	IntervalSec   int    `msgpack:"interval_sec,omitempty"`
+}
+
+// BuildCommandFrame encodes a CommandPayload as a length-prefixed hub→agent frame.
+// No HMAC — TLS authenticates the hub.
+func BuildCommandFrame(p CommandPayload) ([]byte, error) {
+	assert(p.Command != "", "command must not be empty")
+
+	p.SchemaVersion = SchemaVersionCurrent
+	p.PayloadType = PayloadTypeCommand
+
+	data, err := msgpack.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("encode command: %w", err)
+	}
+	assert(len(data) > 0, "encoded command must not be empty")
+
+	frame := make([]byte, FrameHeaderSize+len(data))
+	binary.BigEndian.PutUint32(frame[:FrameHeaderSize], uint32(len(data)))
+	copy(frame[FrameHeaderSize:], data)
+	return frame, nil
+}
+
 // BuildAckFrame returns a minimal hub→agent acknowledgement frame.
 // Format: [4-byte length=1][PayloadTypeAck]. No HMAC — TLS authenticates the hub.
 func BuildAckFrame() []byte {

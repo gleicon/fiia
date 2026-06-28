@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gleicon/fiia/internal/hub/command"
 	"github.com/gleicon/fiia/internal/hub/registry"
 	"github.com/gleicon/fiia/internal/hub/store"
 	"github.com/gleicon/fiia/internal/wire"
@@ -30,7 +31,8 @@ type Listener struct {
 	tls_cfg       *tls.Config
 	reg           *registry.Registry
 	store         store.Store
-	drift_counter *atomic.Int64 // may be nil; incremented on each drift payload
+	drift_counter *atomic.Int64   // may be nil
+	cmdq          *command.Queue  // may be nil; delivers hub→agent commands on heartbeat ACK
 }
 
 func assert(condition bool, message string) {
@@ -39,9 +41,8 @@ func assert(condition bool, message string) {
 	}
 }
 
-// New creates a Listener with the given TLS config, registry, and store.
-// drift_counter may be nil; when non-nil it is incremented on each received drift payload.
-func New(tls_cfg *tls.Config, reg *registry.Registry, s store.Store, drift_counter *atomic.Int64) *Listener {
+// New creates a Listener. drift_counter and cmdq may be nil.
+func New(tls_cfg *tls.Config, reg *registry.Registry, s store.Store, drift_counter *atomic.Int64, cmdq *command.Queue) *Listener {
 	assert(tls_cfg != nil, "tls_cfg must not be nil")
 	assert(reg != nil, "registry must not be nil")
 	assert(s != nil, "store must not be nil")
@@ -51,6 +52,7 @@ func New(tls_cfg *tls.Config, reg *registry.Registry, s store.Store, drift_count
 		reg:           reg,
 		store:         s,
 		drift_counter: drift_counter,
+		cmdq:          cmdq,
 	}
 }
 
@@ -82,7 +84,7 @@ func (l *Listener) ServeListener(ln net.Listener) error {
 }
 
 // handleConn reads a single frame from conn, validates it, routes it, and sends
-// a PayloadTypeAck back to the agent for heartbeat payloads.
+// a response (command or ACK) back to the agent for heartbeat payloads.
 func (l *Listener) handleConn(conn net.Conn) {
 	assert(conn != nil, "conn must not be nil")
 	defer conn.Close()
@@ -99,22 +101,42 @@ func (l *Listener) handleConn(conn net.Conn) {
 		return
 	}
 
-	if l.processFrame(body_bytes, conn.RemoteAddr().String()) {
-		sendAck(conn)
+	node_id, respond := l.processFrame(body_bytes, conn.RemoteAddr().String())
+	if respond {
+		l.sendHeartbeatResponse(conn, node_id)
 	}
 }
 
-// sendAck writes a PayloadTypeAck frame back to the agent.
-// Errors are logged and ignored — the payload was already processed.
-func sendAck(conn net.Conn) {
+// sendHeartbeatResponse sends a command frame if one is pending for node_id,
+// otherwise sends a PayloadTypeAck. Errors are logged and ignored — the payload
+// was already stored before this call.
+func (l *Listener) sendHeartbeatResponse(conn net.Conn, node_id string) {
 	assert(conn != nil, "conn must not be nil")
+	assert(node_id != "", "node_id must not be empty")
 
 	if err := conn.SetWriteDeadline(time.Now().Add(ack_write_timeout_sec * time.Second)); err != nil {
-		log.Printf("ingest: set ACK write deadline: %v", err)
+		log.Printf("ingest: set response write deadline: %v", err)
 		return
 	}
+
+	if l.cmdq != nil {
+		if cmd_str, ok := l.cmdq.Pop(node_id); ok {
+			frame, err := wire.BuildCommandFrame(wire.CommandPayload{Command: cmd_str})
+			if err != nil {
+				log.Printf("ingest: build command frame for %q: %v", node_id, err)
+			} else {
+				if _, err := conn.Write(frame); err != nil {
+					log.Printf("ingest: write command %q to %q: %v", cmd_str, node_id, err)
+				} else {
+					log.Printf("ingest: delivered command %q to node %s", cmd_str, node_id)
+				}
+				return
+			}
+		}
+	}
+
 	if _, err := conn.Write(wire.BuildAckFrame()); err != nil {
-		log.Printf("ingest: write ACK: %v", err)
+		log.Printf("ingest: write ACK to %q: %v", node_id, err)
 	}
 }
 
@@ -148,26 +170,26 @@ func readFrame(conn net.Conn) ([]byte, error) {
 
 // processFrame validates HMAC and routes the payload. All security checks occur here.
 // Order is fixed: split → peek node_id → get secret → verify → peek type → route.
-// Returns true if the caller should send a PayloadTypeAck back to the agent.
-func (l *Listener) processFrame(body_bytes []byte, remote_addr string) bool {
+// Returns (node_id, true) when a heartbeat response (command or ACK) should be sent.
+func (l *Listener) processFrame(body_bytes []byte, remote_addr string) (string, bool) {
 	assert(len(body_bytes) > wire.HMACSize, "body_bytes must be longer than HMACSize")
 
 	payload_bytes, sig_bytes, err := wire.SplitFrame(body_bytes)
 	if err != nil {
 		log.Printf("ingest: split frame from %s: %v", remote_addr, err)
-		return false
+		return "", false
 	}
 
 	node_id, err := wire.PeekNodeID(payload_bytes)
 	if err != nil {
 		log.Printf("ingest: peek node_id from %s: %v", remote_addr, err)
-		return false
+		return "", false
 	}
 
 	secret_bytes, err := l.store.GetNodeSecret(node_id)
 	if err != nil {
 		log.Printf("ingest: unknown node %q from %s: %v", node_id, remote_addr, err)
-		return false
+		return "", false
 	}
 
 	if !wire.Verify(secret_bytes, payload_bytes, sig_bytes) {
@@ -175,25 +197,25 @@ func (l *Listener) processFrame(body_bytes []byte, remote_addr string) bool {
 		if err := l.store.SetAlert(node_id, "HMAC_MISMATCH", time.Now().Unix()); err != nil {
 			log.Printf("ingest: set HMAC_MISMATCH alert for %q: %v", node_id, err)
 		}
-		return false
+		return "", false
 	}
 
 	payload_type, err := wire.PeekPayloadType(payload_bytes)
 	if err != nil {
 		log.Printf("ingest: peek payload_type for node %q: %v", node_id, err)
-		return false
+		return "", false
 	}
 
 	switch payload_type {
 	case wire.PayloadTypeHeartbeat:
 		l.routeHeartbeat(payload_bytes, node_id)
-		return true
+		return node_id, true
 	case wire.PayloadTypeDrift:
 		l.routeDrift(payload_bytes, node_id)
-		return false
+		return "", false
 	default:
 		log.Printf("ingest: unknown payload_type %d for node %q", payload_type, node_id)
-		return false
+		return "", false
 	}
 }
 

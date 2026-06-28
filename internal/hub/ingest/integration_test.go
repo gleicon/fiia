@@ -108,7 +108,7 @@ func TestIntegrationHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls listen: %v", err)
 	}
-	ingest_l := ingest.New(server_tls, reg, s, nil)
+	ingest_l := ingest.New(server_tls, reg, s, nil, nil)
 	go ingest_l.ServeListener(ingest_ln) //nolint:errcheck
 	ingest_addr := ingest_ln.Addr().String()
 
@@ -195,7 +195,7 @@ func TestIntegrationDriftPayload(t *testing.T) {
 
 	reg := registry.New(s)
 	var drift_counter atomic.Int64
-	ingest_l := ingest.New(server_tls, reg, s, &drift_counter)
+	ingest_l := ingest.New(server_tls, reg, s, &drift_counter, nil)
 
 	ingest_ln, err := tls.Listen("tcp", "127.0.0.1:0", server_tls)
 	if err != nil {
