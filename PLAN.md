@@ -4,7 +4,7 @@
 
 **State:** Increments 1–6 fully implemented. Increment 6 delivers disk-backed store-and-forward queue (64-entry ring buffer), hub ACK frames, hub→agent command channel (`audit_now`, `config_update`, `graceful_restart`), and `POST /nodes/{id}/audit_now` + `POST /nodes/{id}/config` API endpoints.
 
-**Next:** Increment 7 scope TBD. Candidates: Ansible baseline git-pull sync, multi-node hub HA (Postgres migration seam), NetBox inventory reader, per-node ingest rate limiting, TLS cert rotation without restart.
+**Next:** Start Increment 7. Three tracks: (1) Postgres migration via `bun` ORM, config-driven — same `Store` interface, swap implementation; (2) per-node ingest rate limiting via token bucket; (3) inventory stays on `InventoryReader` CSV abstraction — no NetBox or git implementations until actually needed.
 
 **Open questions:**
 - Tiger Style in PROJECT.md marked "active for this session" — keep as permanent project constraint, update wording, or drop?
@@ -114,3 +114,25 @@ _Goal: agent survives extended hub outages; hub can trigger on-demand audits wit
 - [x] Agent: on receiving `audit_now` command, drain audit timer and run immediately
 - [x] Hub API: `POST /nodes/{id}/config` — push updated baseline playbook path or interval override
 - [x] Agent: `SIGTERM` from hub command (`graceful_restart`) — clean shutdown, systemd restarts
+
+---
+
+### Increment 7: Storage upgrade, rate limiting, inventory abstraction
+_Goal: hub can run on Postgres for HA; ingest is protected against noisy agents; inventory integration is swap-safe._
+
+**Track A — Postgres migration (D-20)**
+- [ ] Add `bun` ORM dependency (`uptrace/bun`); justify in D-20
+- [ ] Implement `BunStore` satisfying `store.Store` interface for Postgres
+- [ ] Hub config: `db_driver = "sqlite" | "postgres"` + `db_dsn` replaces `db_path`
+- [ ] Store constructor selects implementation based on config; goose migrations work on both dialects
+- [ ] `BunStore` passes the same integration tests as `SQLiteStore` (shared test suite via interface)
+
+**Track B — Ingest rate limiting (D-21)**
+- [ ] Hub config: `rate_limit_rps` per-node (default 1.0; burst 3)
+- [ ] `internal/hub/ingest`: per-node `rate.Limiter` map (`sync.Map`, `golang.org/x/time/rate`)
+- [ ] Exceed limit: drop connection immediately, log warning with node_id and rate
+- [ ] Evict stale limiters on registry expiry (no unbounded memory growth)
+
+**Track C — Inventory abstraction (no new implementations)**
+- [ ] Document `InventoryReader` as the stable extension point for NetBox REST and git-pull baseline sync — no implementation, just DECISIONS.md entry (D-22)
+- [ ] CSV reader remains the only implementation until a concrete integration is required

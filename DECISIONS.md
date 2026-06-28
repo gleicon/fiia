@@ -231,3 +231,39 @@
 **Rationale:** Standard tools only. `tail -f` on multiple files produces `==> filename <==` headers on source switches — awk parses those to label each line. Works everywhere, no install required.
 
 **Implication:** One new Makefile target. No new dependencies.
+
+---
+
+## D-20: Postgres migration strategy and ORM choice
+
+**Question:** The `Store` interface is the seam for SQLite → Postgres. What ORM or query layer should the Postgres implementation use, and how is the database selected at runtime?
+
+**Decision:** **`uptrace/bun` as the ORM layer for both SQLite and Postgres implementations.** Hub config adds `db_driver` (`"sqlite"` | `"postgres"`) and `db_dsn` (replaces `db_path`). Store constructor selects the implementation at startup. Goose migrations run against both dialects — write standard SQL, avoid dialect-specific extensions unless annotated.
+
+**Rationale:** `bun` supports SQLite and Postgres natively with the same API. It is not a code-generation ORM (no `protoc`-style step), works naturally with the existing struct tags, and adds no build tooling. The `Store` interface means the caller never sees the ORM — it is an implementation detail of each concrete store. `sqlc` was considered but requires a codegen step and doesn't add significant safety over `bun`'s type-safe query builder at this scale.
+
+**Implication:** New dependency: `uptrace/bun`. Add D-20 entry. `SQLiteStore` may be reimplemented via bun or kept as-is (existing `modernc.org/sqlite` + raw `database/sql` is stable; bun wraps it if desired). `BunStore` must pass the same test suite as `SQLiteStore` via a shared interface contract test.
+
+---
+
+## D-21: Per-node ingest rate limiting
+
+**Question:** A misbehaving or compromised agent could flood the hub with heartbeats, exhausting connection goroutines and SQLite write bandwidth. Should the hub enforce a per-node rate limit?
+
+**Decision:** **Token-bucket rate limiting per node_id in the ingest listener**, using `golang.org/x/time/rate`. Configurable via `rate_limit_rps` in hub.toml (default: 1.0 RPS, burst 3). Connections that exceed the limit are dropped immediately after the HMAC check (node identity is known at that point). Limiter map uses `sync.Map`; stale entries are evicted on the registry expiry tick.
+
+**Rationale:** Rate limiting is a hub-side defensive measure — the agent is unchanged. Enforcing after HMAC validation ensures we only rate-limit authenticated nodes (not random scanners, which are dropped by the unknown-node check before this). Token bucket allows short legitimate bursts (e.g. startup replay) while capping sustained throughput. Stale eviction prevents unbounded memory growth on large fleets where nodes churn.
+
+**Implication:** New dependency: `golang.org/x/time`. Hub config adds `rate_limit_rps float64`. `Listener` gains a `sync.Map` of `*rate.Limiter` keyed by node_id. Registry expiry tick calls a `PurgeLimiters(active_nodes []string)` method on the listener.
+
+---
+
+## D-22: Inventory reader abstraction as the integration point
+
+**Question:** Fiia currently reads node inventory from a CSV file. NetBox REST, GitLab node definitions, and git-pull baseline sync are plausible future sources. Should these be implemented now?
+
+**Decision:** **No new inventory implementations until a concrete integration is needed.** The `InventoryReader` interface is the stable extension point. CSV remains the only implementation. NetBox REST and git-pull baseline sync are explicitly deferred — their APIs, auth models, and schema shapes are not yet known for this environment, and building a generic adapter now would be speculative.
+
+**Rationale:** "You won't need it" wins here. Both NetBox and git integrations require knowledge of the specific deployment (API tokens, field mappings, branch conventions). Building a generic layer before that knowledge exists produces an abstraction that doesn't fit the actual requirement. When the need arises, implement a concrete `InventoryReader` for that source and swap it in — the interface requires no changes.
+
+**Implication:** No code change. Document the interface contract more explicitly in `docs/architecture.md` as the integration seam. This entry records that the deferral is intentional, not an oversight.
