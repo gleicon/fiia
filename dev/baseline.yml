@@ -1,0 +1,47 @@
+---
+# Fiia dev baseline — synthetic drift detection test.
+#
+# This playbook is deployed to /etc/fiia/baseline.yml on the dev VM by
+# 'make dev-deploy' and is run by the agent in --check --diff mode.
+#
+# Managed state:
+#   /etc/fiia/sentinel     — a file with known content; drift by editing it
+#   /etc/motd              — a login banner; drift by clearing it
+#
+# Introduce drift:   make dev-drift
+# Restore baseline:  make dev-restore
+# Check hub for drift events: make dev-check-drift
+#
+# Constraints: declarative-only (no shell/command/raw tasks per project policy).
+
+- name: Fiia dev baseline
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Managed sentinel file
+      ansible.builtin.copy:
+        content: |
+          # managed by fiia baseline — do not edit
+          version: 1
+          state: ok
+        dest: /etc/fiia/sentinel
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Managed login banner
+      ansible.builtin.copy:
+        content: "Authorized access only. Activity is monitored by Fiia.\n"
+        dest: /etc/motd
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Fiia log directory permissions
+      ansible.builtin.file:
+        path: /var/log/fiia
+        state: directory
+        owner: fiia
+        group: root
+        mode: "0750"

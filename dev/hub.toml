@@ -1,0 +1,9 @@
+[hub]
+listen_addr = ":9443"
+cert_path = "dev/ca/hub_cert.pem"
+key_path = "dev/ca/hub_key.pem"
+db_path = "/tmp/fiia-dev.db"
+metrics_addr = ":9090"
+api_addr = ":9091"
+# inventory_csv_path = "dev/inventory.csv"  # omit to disable reconciler
+# reconcile_interval_sec = 3600

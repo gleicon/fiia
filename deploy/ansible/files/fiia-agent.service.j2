@@ -1,0 +1,43 @@
+[Unit]
+Description=Fiia agent - fleet telemetry and drift detection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User={{ fiia_user }}
+ExecStart={{ fiia_install_dir }}/fiia-agent -config {{ fiia_config_dir }}/agent.toml
+Restart=on-failure
+RestartSec=30
+
+# Ansible needs a writable home to create its tmp directory.
+# fiia user has no /home/fiia (create_home: false), so point HOME to the state dir.
+Environment=HOME=/var/lib/fiia
+# ansible.cfg written by bootstrap suppresses fact gathering and sets tmp paths.
+# Env var is more reliable than cmd.Env propagation through the Go subprocess chain.
+Environment=ANSIBLE_CONFIG=/var/lib/fiia/ansible.cfg
+
+# Resource limits per bootstrap.yml constraints
+CPUQuota=10%
+MemoryMax=256M
+IOReadBandwidthMax=/ 512K
+IOWriteBandwidthMax=/ 512K
+Nice=19
+IOSchedulingClass=idle
+
+# Watchdog: agent must send sd_notify WATCHDOG=1 every 60s or service restarts
+WatchdogSec=120
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ fiia_log_dir }} /var/lib/fiia
+PrivateTmp=true
+CapabilityBoundingSet=
+
+StandardOutput=append:{{ fiia_log_dir }}/agent.log
+StandardError=append:{{ fiia_log_dir }}/agent.log
+
+[Install]
+WantedBy=multi-user.target

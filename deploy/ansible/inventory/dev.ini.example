@@ -1,0 +1,13 @@
+# Dev inventory for Colima/Lima VM.
+# Do not commit the generated dev.ini — it contains a host-specific SSH port.
+# Generate it with: make dev-inventory
+#
+# The generated file looks like:
+#
+# [fleet]
+# colima-vm ansible_host=colima ansible_ssh_common_args="-F /tmp/colima-ssh.cfg"
+#
+# where /tmp/colima-ssh.cfg is created by: colima ssh-config > /tmp/colima-ssh.cfg
+
+[fleet]
+colima-vm ansible_host=colima ansible_ssh_common_args="-F /tmp/colima-ssh.cfg"

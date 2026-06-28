@@ -1,0 +1,13 @@
+[agent]
+node_id = "dev-node-001"
+hub_addr = "127.0.0.1:9443"
+ca_cert_path = "dev/ca/root_ca.pem"
+# Generate a random 32-byte hex secret: openssl rand -hex 32
+hmac_secret_hex = "0000000000000000000000000000000000000000000000000000000000000001"
+heartbeat_interval_sec = 300
+connect_timeout_sec = 10
+# ansible_playbook_path = "/etc/fiia/baseline.yml"  # omit to disable audit
+# drift_log_path = "/tmp/fiia-drift.log"            # default: /var/log/fiia/drift.log
+# audit_interval_sec = 1200
+# audit_jitter_max_sec = 120
+# audit_timeout_sec = 600

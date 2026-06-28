@@ -1,0 +1,12 @@
+/var/log/fiia/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 fiia root
+    postrotate
+        systemctl kill --signal=HUP fiia-agent 2>/dev/null || true
+    endscript
+}

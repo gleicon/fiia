@@ -1,0 +1,26 @@
+-- +goose Up
+
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id       TEXT    PRIMARY KEY,
+    last_seen_unix INTEGER NOT NULL DEFAULT 0,
+    status        TEXT    NOT NULL DEFAULT 'UNKNOWN'
+);
+
+CREATE TABLE IF NOT EXISTS node_secrets (
+    node_id      TEXT    PRIMARY KEY,
+    secret_bytes BLOB    NOT NULL,
+    created_unix INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    node_id      TEXT NOT NULL,
+    alert_type   TEXT NOT NULL,
+    created_unix INTEGER NOT NULL,
+    PRIMARY KEY (node_id, alert_type)
+);
+
+-- +goose Down
+
+DROP TABLE IF EXISTS alerts;
+DROP TABLE IF EXISTS node_secrets;
+DROP TABLE IF EXISTS nodes;

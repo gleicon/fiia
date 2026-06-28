@@ -1,0 +1,137 @@
+---
+# Fiia agent bootstrap playbook.
+# Runs once per node during fleet onboarding. Idempotent.
+# Constraints:
+#   - serial: 5% to partition rollout by workload tag
+#   - No shell/command/raw tasks (declarative-only policy)
+#   - Installs ansible via OS package manager (apt/dnf); EPEL enabled on RedHat family
+#   - Generates per-node HMAC secret; writes to /etc/fiia/agent.toml (0400, fiia:root)
+#   - Systemd resource limits: CPUQuota=10%, MemoryMax=256M (covers ansible subprocess), IOBandwidth=512K
+#
+# Required variables (set in inventory or group_vars):
+#   fiia_hub_addr           - hub TLS ingest address (e.g. hub.example.com:9443)
+#   fiia_hub_api_addr       - hub REST API address (e.g. hub.example.com:9091)
+#   fiia_hub_hmac_secret_hex - 32-byte hex HMAC secret for this node (per-node unique)
+#   fiia_ca_cert            - PEM content of the root CA cert
+#   fiia_agent_binary       - local path to fiia-agent binary to deploy
+
+- name: Bootstrap fiia agent
+  hosts: fleet
+  serial: "5%"
+  become: true
+  vars:
+    fiia_install_dir: /usr/local/bin
+    fiia_config_dir: /etc/fiia
+    fiia_log_dir: /var/log/fiia
+    fiia_user: fiia
+    fiia_heartbeat_interval_sec: 300
+    fiia_audit_interval_sec: 1200
+    fiia_audit_jitter_max_sec: 120
+    fiia_audit_timeout_sec: 600
+    fiia_ansible_playbook_path: "{{ fiia_config_dir }}/baseline.yml"
+
+  tasks:
+    - name: Enable EPEL repository (RedHat family — required for ansible package)
+      ansible.builtin.package:
+        name: epel-release
+        state: present
+      when: ansible_os_family == 'RedHat'
+
+    - name: Install ansible (required by fiia-agent for audit runs)
+      ansible.builtin.package:
+        name: ansible
+        state: present
+
+    - name: Create fiia system user (no login shell, no sudo)
+      ansible.builtin.user:
+        name: "{{ fiia_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        state: present
+
+    - name: Create config, log, and state directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ fiia_config_dir }}", owner: root, mode: "0755" }
+        - { path: "{{ fiia_log_dir }}", owner: "{{ fiia_user }}", mode: "0750" }
+        - { path: "/var/lib/fiia", owner: "{{ fiia_user }}", mode: "0700" }
+
+    - name: Deploy root CA certificate
+      ansible.builtin.copy:
+        content: "{{ fiia_ca_cert }}"
+        dest: "{{ fiia_config_dir }}/root_ca.pem"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Write agent configuration (contains HMAC secret — 0400)
+      ansible.builtin.template:
+        src: agent.toml.j2
+        dest: "{{ fiia_config_dir }}/agent.toml"
+        owner: "{{ fiia_user }}"
+        group: root
+        mode: "0400"
+
+    - name: Write ansible.cfg (disables fact gathering; sets tmp paths for fiia service user)
+      ansible.builtin.copy:
+        dest: /var/lib/fiia/ansible.cfg
+        owner: "{{ fiia_user }}"
+        group: root
+        mode: "0640"
+        content: |
+          [defaults]
+          gathering = explicit
+          local_tmp = /var/lib/fiia/.ansible/tmp
+          remote_tmp = /var/lib/fiia/.ansible/tmp
+
+    - name: Install fiia-agent binary
+      ansible.builtin.copy:
+        src: "{{ fiia_agent_binary }}"
+        dest: "{{ fiia_install_dir }}/fiia-agent"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install systemd unit
+      ansible.builtin.template:
+        src: files/fiia-agent.service.j2
+        dest: /etc/systemd/system/fiia-agent.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd
+
+    - name: Install logrotate config
+      ansible.builtin.copy:
+        src: files/fiia-logrotate
+        dest: /etc/logrotate.d/fiia
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable and start fiia-agent
+      ansible.builtin.systemd:
+        name: fiia-agent
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Dry-run handshake — wait for node to appear in hub registry
+      ansible.builtin.uri:
+        url: "http://{{ fiia_hub_api_addr }}/nodes/{{ inventory_hostname }}/status"
+        status_code: 200
+      register: handshake_result
+      retries: 6
+      delay: 30
+      until: handshake_result.status == 200
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
