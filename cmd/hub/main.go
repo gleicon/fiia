@@ -47,9 +47,13 @@ func main() {
 		log.Fatalf("hub: load config %q: %v", *config_path, err)
 	}
 
-	db, err := store.NewSQLiteStore(cfg.DBPath)
+	conn := cfg.DBPath
+	if cfg.DBDriver == "postgres" {
+		conn = cfg.DBDSN
+	}
+	db, err := store.Open(cfg.DBDriver, conn)
 	if err != nil {
-		log.Fatalf("hub: open store %q: %v", cfg.DBPath, err)
+		log.Fatalf("hub: open store driver=%q: %v", cfg.DBDriver, err)
 	}
 	defer db.Close()
 
@@ -76,7 +80,7 @@ func main() {
 	metrics_srv := metrics.New(reg, db, &drift_counter,
 		prometheus.DefaultRegisterer, prometheus.DefaultGatherer)
 	api_srv := hubapi.New(db, cmdq)
-	ingest_l := ingest.New(tls_cfg, reg, db, &drift_counter, cmdq)
+	ingest_l := ingest.New(tls_cfg, reg, db, &drift_counter, cmdq, cfg.RateLimitRPS, cfg.RateLimitBurst)
 
 	stop_ch := make(chan struct{})
 

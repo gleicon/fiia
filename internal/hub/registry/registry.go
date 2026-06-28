@@ -67,10 +67,7 @@ func (r *Registry) Update(node_id string, timestamp_unix int64, m wire.USEMetric
 	state.Status = "OK"
 	state.Metrics = m
 	r.mu.Unlock()
-
-	if err := r.store.UpdateHeartbeat(node_id, timestamp_unix); err != nil {
-		log.Printf("registry: flush heartbeat for %q: %v", node_id, err)
-	}
+	// DB persistence (UpdateHeartbeat) is handled by ingest's async write queue.
 }
 
 // GetAll returns a snapshot of all node states.

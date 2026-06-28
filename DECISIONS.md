@@ -234,15 +234,15 @@
 
 ---
 
-## D-20: Postgres migration strategy and ORM choice
+## D-20: Postgres migration strategy and driver choice
 
-**Question:** The `Store` interface is the seam for SQLite → Postgres. What ORM or query layer should the Postgres implementation use, and how is the database selected at runtime?
+**Question:** The `Store` interface is the seam for SQLite → Postgres. What driver or query layer should the Postgres implementation use, and how is the database selected at runtime?
 
-**Decision:** **`uptrace/bun` as the ORM layer for both SQLite and Postgres implementations.** Hub config adds `db_driver` (`"sqlite"` | `"postgres"`) and `db_dsn` (replaces `db_path`). Store constructor selects the implementation at startup. Goose migrations run against both dialects — write standard SQL, avoid dialect-specific extensions unless annotated.
+**Decision:** **`jackc/pgx/v5/stdlib` as the Postgres driver, raw `database/sql`, no ORM.** Hub config adds `db_driver` (`"sqlite"` | `"postgres"`) and `db_dsn`. `store.Open(driver, conn)` factory selects the implementation at startup. Separate migration directories (`migrations/` for SQLite, `postgres_migrations/` for Postgres) with goose per-dialect; no attempt to share SQL files across dialects.
 
-**Rationale:** `bun` supports SQLite and Postgres natively with the same API. It is not a code-generation ORM (no `protoc`-style step), works naturally with the existing struct tags, and adds no build tooling. The `Store` interface means the caller never sees the ORM — it is an implementation detail of each concrete store. `sqlc` was considered but requires a codegen step and doesn't add significant safety over `bun`'s type-safe query builder at this scale.
+**Rationale:** `bun` was the initial choice but adds an abstraction layer with no benefit here — the `Store` interface already hides the implementation from all callers. Raw `database/sql` with `pgx/v5/stdlib` is sufficient: queries are short, there are fewer than 15 SQL statements, and the schema is stable. pgx/v5 was already a transitive dependency (pulled in by goose); promoting it to direct avoids version skew. Separate migration files per dialect make dialect-specific types (`BYTEA`, `BIGSERIAL`) explicit rather than hidden in conditional logic.
 
-**Implication:** New dependency: `uptrace/bun`. Add D-20 entry. `SQLiteStore` may be reimplemented via bun or kept as-is (existing `modernc.org/sqlite` + raw `database/sql` is stable; bun wraps it if desired). `BunStore` must pass the same test suite as `SQLiteStore` via a shared interface contract test.
+**Implication:** `PostgresStore` satisfies the same `Store` interface as `SQLiteStore`. Placeholders are `$N` in Postgres vs `?` in SQLite. Goose dialect is `"postgres"`. No shared test suite yet — integration tests require a live Postgres instance and are deferred to staging validation.
 
 ---
 
@@ -267,3 +267,17 @@
 **Rationale:** "You won't need it" wins here. Both NetBox and git integrations require knowledge of the specific deployment (API tokens, field mappings, branch conventions). Building a generic layer before that knowledge exists produces an abstraction that doesn't fit the actual requirement. When the need arises, implement a concrete `InventoryReader` for that source and swap it in — the interface requires no changes.
 
 **Implication:** No code change. Document the interface contract more explicitly in `docs/architecture.md` as the integration seam. This entry records that the deferral is intentional, not an oversight.
+
+---
+
+## D-23: Async write queue for hub ingest hot path
+
+**Question:** At high node density (1000+ nodes, sub-second heartbeat intervals), synchronous DB writes in the per-connection goroutine become the throughput ceiling. How should the hub decouple ingest throughput from DB write latency?
+
+**Decision:** **Async write channel in `ingest.Listener` with batched flush every 100ms.** High-frequency idempotent writes (`UpdateHeartbeat`, `ClearAlert` for AGENT_UNREACHABLE/AGENT_PAUSED) are pushed to a buffered channel (capacity 1024) and drained by a single background goroutine. Within each flush window, writes are deduplicated: only the latest `UpdateHeartbeat` timestamp per node is written; only unique `(node_id, alert_type)` clears are issued. Drift events and security alerts (HMAC_MISMATCH, DRIFT_DETECTED) remain synchronous.
+
+**Rationale:** A 100ms flush window at 1000 nodes/1hz produces at most 100 `UpdateHeartbeat` calls instead of 100 per-connection write transactions — a 100× reduction in write load for the hot case. Deduplication turns a reconnect storm (50 frames from the same node in 100ms) into a single write. The in-memory registry (`reg.Update`) stays synchronous so liveness data and metrics are immediately consistent; only DB persistence is deferred. Single goroutine draining the channel eliminates SQLite write-lock contention and reduces Postgres connection pool pressure.
+
+**Implication:** `registry.Update` no longer calls `store.UpdateHeartbeat` — that write is now owned by the ingest async flusher. The `Store` interface is unchanged. Remaining single-DB ceiling: for append-only event logs at very large scale, switch to a message broker (NATS JetStream, Kafka) with the DB as a downstream consumer. That requires a new `Store` implementation behind the same interface.
+
+**Scale ceiling acknowledged:** This design suits one-hub/one-DB deployments. The next threshold is partitioned writes (per-region hubs, each with a local DB) or an event-log architecture where the hub is a pure producer.

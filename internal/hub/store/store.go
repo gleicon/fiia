@@ -1,5 +1,27 @@
 package store
 
+import "fmt"
+
+// Open selects a Store implementation by driver.
+// For "sqlite", conn is a file path. For "postgres", conn is a connection DSN.
+func Open(driver, conn string) (Store, error) {
+	if driver == "" {
+		return nil, fmt.Errorf("driver must not be empty")
+	}
+	if conn == "" {
+		return nil, fmt.Errorf("conn must not be empty")
+	}
+
+	switch driver {
+	case "sqlite":
+		return NewSQLiteStore(conn)
+	case "postgres":
+		return NewPostgresStore(conn)
+	default:
+		return nil, fmt.Errorf("unknown db_driver %q: must be sqlite or postgres", driver)
+	}
+}
+
 // Node represents a fleet node known to the hub.
 type Node struct {
 	ID           string
