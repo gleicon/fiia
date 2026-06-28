@@ -190,6 +190,15 @@ func PeekPayloadType(data []byte) (uint8, error) {
 	return peek.PayloadType, nil
 }
 
+// BuildAckFrame returns a minimal hub→agent acknowledgement frame.
+// Format: [4-byte length=1][PayloadTypeAck]. No HMAC — TLS authenticates the hub.
+func BuildAckFrame() []byte {
+	frame := make([]byte, FrameHeaderSize+1)
+	binary.BigEndian.PutUint32(frame[:FrameHeaderSize], 1)
+	frame[FrameHeaderSize] = PayloadTypeAck
+	return frame
+}
+
 // BuildFrame assembles a length-prefixed wire frame:
 // [4-byte big-endian uint32 = len(payload)+HMACSize][payload_bytes][HMAC-SHA256]
 func BuildFrame(secret_bytes, payload_bytes []byte) []byte {

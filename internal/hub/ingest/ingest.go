@@ -18,6 +18,8 @@ import (
 const (
 	// read_timeout_sec: maximum time to read a single frame from a client.
 	read_timeout_sec = 30
+	// ack_write_timeout_sec: time allowed to write an ACK frame back to the agent.
+	ack_write_timeout_sec = 5
 	// frame_size_max_bytes: reject frames larger than 1 MB to prevent memory exhaustion.
 	frame_size_max_bytes = 1 << 20 // 1 MB
 )
@@ -79,7 +81,8 @@ func (l *Listener) ServeListener(ln net.Listener) error {
 	}
 }
 
-// handleConn reads a single frame from conn, validates it, and routes it.
+// handleConn reads a single frame from conn, validates it, routes it, and sends
+// a PayloadTypeAck back to the agent for heartbeat payloads.
 func (l *Listener) handleConn(conn net.Conn) {
 	assert(conn != nil, "conn must not be nil")
 	defer conn.Close()
@@ -96,7 +99,23 @@ func (l *Listener) handleConn(conn net.Conn) {
 		return
 	}
 
-	l.processFrame(body_bytes, conn.RemoteAddr().String())
+	if l.processFrame(body_bytes, conn.RemoteAddr().String()) {
+		sendAck(conn)
+	}
+}
+
+// sendAck writes a PayloadTypeAck frame back to the agent.
+// Errors are logged and ignored — the payload was already processed.
+func sendAck(conn net.Conn) {
+	assert(conn != nil, "conn must not be nil")
+
+	if err := conn.SetWriteDeadline(time.Now().Add(ack_write_timeout_sec * time.Second)); err != nil {
+		log.Printf("ingest: set ACK write deadline: %v", err)
+		return
+	}
+	if _, err := conn.Write(wire.BuildAckFrame()); err != nil {
+		log.Printf("ingest: write ACK: %v", err)
+	}
 }
 
 // readFrame reads the 4-byte length prefix then the body.
@@ -129,25 +148,26 @@ func readFrame(conn net.Conn) ([]byte, error) {
 
 // processFrame validates HMAC and routes the payload. All security checks occur here.
 // Order is fixed: split → peek node_id → get secret → verify → peek type → route.
-func (l *Listener) processFrame(body_bytes []byte, remote_addr string) {
+// Returns true if the caller should send a PayloadTypeAck back to the agent.
+func (l *Listener) processFrame(body_bytes []byte, remote_addr string) bool {
 	assert(len(body_bytes) > wire.HMACSize, "body_bytes must be longer than HMACSize")
 
 	payload_bytes, sig_bytes, err := wire.SplitFrame(body_bytes)
 	if err != nil {
 		log.Printf("ingest: split frame from %s: %v", remote_addr, err)
-		return
+		return false
 	}
 
 	node_id, err := wire.PeekNodeID(payload_bytes)
 	if err != nil {
 		log.Printf("ingest: peek node_id from %s: %v", remote_addr, err)
-		return
+		return false
 	}
 
 	secret_bytes, err := l.store.GetNodeSecret(node_id)
 	if err != nil {
 		log.Printf("ingest: unknown node %q from %s: %v", node_id, remote_addr, err)
-		return
+		return false
 	}
 
 	if !wire.Verify(secret_bytes, payload_bytes, sig_bytes) {
@@ -155,22 +175,25 @@ func (l *Listener) processFrame(body_bytes []byte, remote_addr string) {
 		if err := l.store.SetAlert(node_id, "HMAC_MISMATCH", time.Now().Unix()); err != nil {
 			log.Printf("ingest: set HMAC_MISMATCH alert for %q: %v", node_id, err)
 		}
-		return
+		return false
 	}
 
 	payload_type, err := wire.PeekPayloadType(payload_bytes)
 	if err != nil {
 		log.Printf("ingest: peek payload_type for node %q: %v", node_id, err)
-		return
+		return false
 	}
 
 	switch payload_type {
 	case wire.PayloadTypeHeartbeat:
 		l.routeHeartbeat(payload_bytes, node_id)
+		return true
 	case wire.PayloadTypeDrift:
 		l.routeDrift(payload_bytes, node_id)
+		return false
 	default:
 		log.Printf("ingest: unknown payload_type %d for node %q", payload_type, node_id)
+		return false
 	}
 }
 

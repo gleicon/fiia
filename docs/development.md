@@ -1,0 +1,208 @@
+# Fiia — Development
+
+## Prerequisites
+
+| Tool | Purpose |
+|------|---------|
+| Go 1.24+ | Build both binaries |
+| Colima | Linux VM for local agent testing |
+| `pip3 install ansible` | Run bootstrap playbook from macOS |
+| Ansible (on VM) | Installed by bootstrap playbook; not required locally |
+
+## Build
+
+```sh
+make build          # builds fiia-agent and fiia-hub for host OS
+make test           # runs go test ./...
+```
+
+Cross-compile for the Colima VM arch (detected live):
+
+```sh
+make dev-build
+```
+
+## Local dev loop
+
+### 1. Start hub (macOS)
+
+```sh
+make dev-hub
+```
+
+Generates dev TLS certs (`dev/ca/`), seeds the `colima-dev` node secret, starts hub on:
+
+| Port | Service |
+|------|---------|
+| `:9443` | TLS ingest |
+| `:9091` | REST API |
+| `:9090` | Prometheus metrics |
+
+### 2. Start VM
+
+```sh
+make dev-vm-start
+```
+
+Starts a 2 CPU / 2 GB Ubuntu VM via Colima.
+
+### 3. Deploy agent to VM
+
+```sh
+make dev-deploy
+```
+
+Cross-compiles, generates SSH inventory, runs Ansible bootstrap playbook. Certs are **not** regenerated — use `make dev-certs-force` to rotate.
+
+### 4. Verify
+
+```sh
+make dev-run          # systemctl status fiia-agent in VM
+make dev-logs         # tail -f /var/log/fiia/agent.log
+make dev-drift-log    # tail -f /var/log/fiia/drift.log
+make dev-journal      # journalctl -f for fiia-agent unit
+make dev-watch        # agent.log + drift.log side-by-side, labeled by source
+```
+
+```sh
+curl http://localhost:9091/nodes
+curl http://localhost:9091/nodes/colima-dev/status
+curl http://localhost:9090/metrics | grep fiia_nodes_alive
+```
+
+## Drift detection test
+
+The dev baseline (`dev/baseline.yml`) manages two files on the VM:
+- `/etc/fiia/sentinel`
+- `/etc/motd`
+
+```sh
+make dev-drift        # corrupt both files on VM
+# wait ~120s for the audit cycle
+make dev-check-drift  # query hub: node status, drift events, alerts
+make dev-restore      # restore managed files; next audit reports OK
+```
+
+## Makefile reference
+
+```
+build               build both binaries (host OS)
+test                run all tests
+
+dev-vm-start        start Colima Ubuntu VM
+dev-vm-stop         stop Colima VM
+dev-hub             generate certs + seed node secret + start hub (macOS)
+dev-build           cross-compile agent for VM arch (queried live from Colima)
+dev-certs           generate dev/ca/ TLS certs (no-op if already present)
+dev-certs-force     force-rotate dev/ca/ TLS certs (redeploy hub + all agents after)
+dev-inventory       generate Ansible SSH inventory from colima ssh-config
+dev-deploy          build + inventory + run Ansible bootstrap playbook
+dev-run             show agent systemctl status in VM
+dev-logs            follow /var/log/fiia/agent.log
+dev-drift-log       follow /var/log/fiia/drift.log
+dev-journal         follow systemd journal for fiia-agent
+dev-watch           stream agent.log + drift.log labeled by source
+dev-stop            stop fiia-agent in VM
+dev-drift           corrupt managed files to trigger drift detection
+dev-restore         restore managed files to baseline state
+dev-check-drift     query hub API for node status, drift events, alerts
+```
+
+## REST API
+
+All endpoints return JSON. No authentication — bind to localhost in production.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/nodes` | All nodes and last-seen timestamps |
+| `GET` | `/nodes/{id}/status` | Single node status |
+| `GET` | `/nodes/{id}/drift` | Last 50 drift events |
+| `GET` | `/alerts` | All active alerts |
+
+### Alert types
+
+| Alert | Raised when | Cleared when |
+|-------|-------------|--------------|
+| `DRIFT_DETECTED` | Audit reports changed tasks | Next audit reports `OK` |
+| `HMAC_MISMATCH` | Frame received with invalid HMAC | Manual |
+| `AGENT_PAUSED` | Node silent > paused threshold | Next heartbeat |
+| `AGENT_UNREACHABLE` | Node silent > unreachable threshold | Next heartbeat |
+| `UNINSTRUMENTED_SERVER` | Node in inventory CSV but never reported | First heartbeat |
+
+## Prometheus metrics
+
+Scraped at `http://<hub>:9090/metrics`.
+
+| Metric | Description |
+|--------|-------------|
+| `fiia_nodes_alive_total` | Nodes with a heartbeat in the last 10 minutes |
+| `fiia_nodes_total` | Total nodes known to the hub |
+| `fiia_drift_events_total` | Drift events received since hub start |
+| `fiia_nodes_paused` | Nodes missing one heartbeat window |
+| `fiia_nodes_unreachable` | Nodes missing two+ heartbeat windows |
+| `fiia_nodes_uninstrumented` | Nodes in inventory CSV but never reported |
+| `fiia_node_cpu_util_pct{node_id}` | Per-node CPU utilization % |
+| `fiia_node_mem_util_pct{node_id}` | Per-node memory utilization % |
+| `fiia_node_disk_util_pct{node_id}` | Per-node disk utilization % |
+| `fiia_node_net_util_bps{node_id}` | Per-node network bytes/sec |
+
+## Configuration
+
+### Agent — `/etc/fiia/agent.toml` (root:root, 0400)
+
+```toml
+[agent]
+node_id               = "hostname"
+hub_addr              = "hub.example.com:9443"
+hmac_secret_hex       = "<32-byte hex>"         # per-node unique, generated by bootstrap
+ca_cert_path          = "/etc/fiia/root_ca.pem"
+heartbeat_interval_sec = 300
+ansible_playbook_path = "/etc/fiia/baseline.yml" # omit to disable audit
+drift_log_path        = "/var/log/fiia/drift.log"
+audit_interval_sec    = 1200
+audit_jitter_max_sec  = 120
+audit_timeout_sec     = 600
+queue_dir             = "/var/lib/fiia/queue"    # disk queue for store-and-forward
+```
+
+### Hub — `/etc/fiia/hub.toml`
+
+```toml
+[hub]
+listen_addr   = ":9443"
+cert_path     = "/etc/fiia/hub_cert.pem"
+key_path      = "/etc/fiia/hub_key.pem"
+db_path       = "/var/lib/fiia/hub.db"
+metrics_addr  = "127.0.0.1:9090"
+api_addr      = "127.0.0.1:9091"
+# inventory_csv_path     = "/etc/fiia/inventory.csv"  # omit to disable reconciler
+# reconcile_interval_sec = 3600
+```
+
+## Production deployment
+
+See [step-ca-setup.md](step-ca-setup.md) for TLS CA setup.
+
+```sh
+ansible-playbook \
+  -i inventory/production.ini \
+  deploy/ansible/bootstrap.yml \
+  -e @secrets/fleet-vars.yml    # contains fiia_hub_hmac_secret_hex per host
+```
+
+The bootstrap playbook (5% serial batching):
+1. Installs `ansible-core` on the target node
+2. Creates `fiia` system user (no login shell, no sudo)
+3. Deploys root CA, agent config (0400), binary, systemd unit, logrotate
+4. Creates `/var/lib/fiia/queue/` directory
+5. Enables and starts the service
+6. Polls `GET /nodes/{hostname}/status` to confirm registration before releasing
+
+## Security invariants
+
+These must never be violated:
+
+- Hub validates HMAC **before** decoding MessagePack — no exceptions
+- `InsecureSkipVerify` is forbidden in all TLS configs
+- Agent makes no inbound network connections and has no write path to host config
+- Agent config (`agent.toml`) is mode 0400, owned by root

@@ -28,6 +28,7 @@ type AgentConfig struct {
 	AuditIntervalSec     int
 	AuditJitterMaxSec    int
 	AuditTimeoutSec      int
+	QueueDir             string
 }
 
 type agentTOML struct {
@@ -46,6 +47,7 @@ type agentSection struct {
 	AuditIntervalSec     int    `toml:"audit_interval_sec"`
 	AuditJitterMaxSec    int    `toml:"audit_jitter_max_sec"`
 	AuditTimeoutSec      int    `toml:"audit_timeout_sec"`
+	QueueDir             string `toml:"queue_dir"`
 }
 
 func assert(condition bool, message string) {
@@ -112,6 +114,10 @@ func Load(path string) (*AgentConfig, error) {
 	}
 	if raw.Agent.DriftLogPath == "" {
 		cfg.DriftLogPath = "/var/log/fiia/drift.log"
+	}
+	cfg.QueueDir = raw.Agent.QueueDir
+	if cfg.QueueDir == "" {
+		cfg.QueueDir = "/var/lib/fiia/queue"
 	}
 
 	assert(cfg.NodeID != "", "parsed node_id must not be empty")

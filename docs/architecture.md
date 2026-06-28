@@ -1,0 +1,137 @@
+# Fiia — Architecture
+
+## Overview
+
+Fiia is structured as two independent binaries sharing a single wire contract package. The hub and agent never import each other's internals; `internal/wire` is the only shared package.
+
+```
+[edge node]                               [hub host]
+
+fiia-agent
+  ├─ heartbeat goroutine (5 min)          fiia-hub
+  │   ├─ collect USE metrics (/proc)        ├─ ingest (TLS :9443)
+  │   └─ send HeartbeatPayload ──────────→  │   ├─ HMAC verify (before decode)
+  │                                         │   ├─ registry.Update()
+  ├─ audit goroutine (20 min ± jitter)      │   └─ store.AppendDrift()
+  │   ├─ ansible-playbook --check           │
+  │   └─ send DriftPayload ──────────────→  ├─ registry (in-memory + SQLite flush)
+  │                                         │   └─ expiry goroutine (1 min tick)
+  └─ sd_notify watchdog (25s)               │
+                                            ├─ inventory reconciler (configurable tick)
+                                            ├─ REST API (HTTP :9091)
+                                            └─ Prometheus metrics (HTTP :9090)
+```
+
+## Component breakdown
+
+### Agent
+
+| Package | Responsibility |
+|---------|----------------|
+| `cmd/agent` | Wires packages; handles SIGTERM; calls `audit.Probe` once at startup |
+| `internal/agent/config` | Loads and validates `agent.toml` |
+| `internal/agent/heartbeat` | 5-min heartbeat ticker; adaptive backoff (5→10→20→40s) on hub failure; fixed 25s watchdog ticker for sd_notify |
+| `internal/agent/telemetry` | Reads `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`, PSI pressure files; `sync.Pool` buffer reuse |
+| `internal/agent/audit` | Forks `ansible-playbook --check --diff` under a timeout; parses exit codes; writes `/var/lib/fiia/.ansible/audit.cfg` before each invocation; `Probe()` at startup |
+| `internal/agent/transport` | TLS 1.3 client; per-send connection; disk queue for store-and-forward |
+| `internal/agent/queue` | Disk-backed ring buffer (64 entries, `/var/lib/fiia/queue/`); write-before-send; advance on hub ACK |
+| `internal/agent/sdnotify` | Inline sd_notify (no CGO, no external dep); writes `READY=1` / `WATCHDOG=1` to `$NOTIFY_SOCKET` |
+
+### Hub
+
+| Package | Responsibility |
+|---------|----------------|
+| `cmd/hub` | Wires packages; handles SIGTERM; starts ingest and metrics servers |
+| `internal/hub/config` | Loads and validates `hub.toml` |
+| `internal/hub/ingest` | TLS 1.3 listener; per-connection goroutine; enforces HMAC validation before MessagePack decode; sends `PayloadTypeAck` after storing each heartbeat |
+| `internal/hub/registry` | In-memory node state map (`sync.RWMutex`); flushes to store on each heartbeat; expiry goroutine marks `AGENT_PAUSED` / `AGENT_UNREACHABLE` |
+| `internal/hub/store` | `Store` interface; SQLite implementation via `modernc.org/sqlite` (pure Go); goose migrations |
+| `internal/hub/inventory` | `InventoryReader` interface; CSV implementation; reconciler goroutine flags `UNINSTRUMENTED_SERVER` |
+| `internal/hub/metrics` | Prometheus `/metrics` handler; custom collector for per-node USE gauges; `/healthz` endpoint |
+| `internal/hub/api` | REST API: `GET /nodes`, `GET /nodes/{id}/status`, `GET /nodes/{id}/drift`, `GET /alerts` |
+
+### Shared
+
+| Package | Responsibility |
+|---------|----------------|
+| `internal/wire` | `HeartbeatPayload`, `DriftPayload` structs; `Sign`, `Verify`, `BuildFrame`, `BuildAckFrame`, `SplitFrame`, `PeekNodeID`, `PeekPayloadType`; imports nothing internal |
+
+## Data flows
+
+### Heartbeat path
+
+```
+agent:heartbeat
+  → wire.EncodeHeartbeat + wire.BuildFrame
+  → queue.Write (disk)
+  → transport.sendFrameExpectAck (TLS)
+  → hub:ingest.readFrame
+  → wire.SplitFrame → PeekNodeID → store.GetNodeSecret → wire.Verify
+  → wire.PeekPayloadType → routeHeartbeat
+  → registry.Update + store.ClearAlert (AGENT_UNREACHABLE, AGENT_PAUSED)
+  → ingest.sendAck (PayloadTypeAck frame)
+  → transport.readAck → queue.Advance
+```
+
+### Drift path
+
+```
+agent:audit.Run (ansible-playbook --check --diff)
+  → wire.EncodeDrift + wire.BuildFrame
+  → queue.Write (disk)
+  → [delivered on next heartbeat drain, or immediately if hub reachable]
+  → hub:ingest.routeDrift
+  → store.AppendDrift
+  → store.SetAlert (DRIFT_DETECTED) or store.ClearAlert (OK)
+```
+
+### Expiry path
+
+```
+hub:registry expiry goroutine (1 min tick)
+  → for each node: if last_seen > paused_threshold → store.SetAlert(AGENT_PAUSED)
+                   if last_seen > unreachable_threshold → store.SetAlert(AGENT_UNREACHABLE)
+  → log fleet summary (total / alive / paused / unreachable / drift count)
+```
+
+### Inventory reconciliation path
+
+```
+hub:inventory reconciler (configurable tick, runs immediately on start)
+  → InventoryReader.ListNodes
+  → for each node not in registry: store.SetAlert(UNINSTRUMENTED_SERVER)
+```
+
+## Dependency rules
+
+- `cmd/agent` imports `internal/agent/*` and `internal/wire` — never `internal/hub/*`
+- `cmd/hub` imports `internal/hub/*` and `internal/wire` — never `internal/agent/*`
+- `internal/wire` imports nothing internal — it is the sole shared contract
+- `internal/hub/store` is a leaf — no imports from other hub packages
+- No new external dependencies without a written decision in `DECISIONS.md`
+
+## Storage
+
+The hub uses SQLite (pure Go, `modernc.org/sqlite`) via the `Store` interface. The interface is the Postgres migration seam: when the hub goes multi-node for HA, swap the implementation without touching any calling code.
+
+Tables: `nodes`, `node_secrets`, `drift_events`, `alerts`. Schema managed by `pressly/goose/v3` with embedded SQL migrations.
+
+## Upgrade paths
+
+| Current | Trigger | Upgrade path |
+|---------|---------|--------------|
+| SQLite | Hub goes multi-node | Implement `Store` interface for Postgres; no caller changes |
+| CSV inventory | NetBox deployed | Implement `InventoryReader` for NetBox REST; no caller changes |
+| HMAC per-node secrets | PKI/SPIFFE deployed | SPIFFE/SPIRE as long-term direction; no current timeline |
+
+## Resource constraints (systemd-enforced on edge nodes)
+
+| Resource | Limit |
+|----------|-------|
+| CPU | `CPUQuota=10%` |
+| Memory | `MemoryMax=256M` |
+| Disk I/O | `IOReadBandwidthMax=512K` / `IOWriteBandwidthMax=512K` |
+| Scheduling | `Nice=19`, `IOSchedulingClass=idle` |
+| Watchdog | `WatchdogSec=120` |
+
+The agent uses `sync.Pool` for `/proc` read buffers and `GOGC=off` to prevent GC thrashing; the hard ceiling is kernel-enforced by `MemoryMax`.
