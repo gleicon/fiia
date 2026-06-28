@@ -115,7 +115,7 @@ func (srv *Server) postAuditNow(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "command queue not available", http.StatusServiceUnavailable)
 		return
 	}
-	srv.cmdq.Enqueue(node_id, "audit_now")
+	srv.cmdq.Enqueue(node_id, command.Entry{Command: "audit_now"})
 	log.Printf("api: enqueued audit_now for node %s", node_id)
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -144,7 +144,11 @@ func (srv *Server) postConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "at least one of playbook_path or interval_sec required", http.StatusBadRequest)
 		return
 	}
-	srv.cmdq.Enqueue(node_id, "config_update")
+	srv.cmdq.Enqueue(node_id, command.Entry{
+		Command:      "config_update",
+		PlaybookPath: req.PlaybookPath,
+		IntervalSec:  req.IntervalSec,
+	})
 	log.Printf("api: enqueued config_update for node %s (playbook=%q interval=%d)", node_id, req.PlaybookPath, req.IntervalSec)
 	w.WriteHeader(http.StatusAccepted)
 }

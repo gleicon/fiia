@@ -4,9 +4,7 @@
 
 **State:** Increments 1–6 fully implemented. Increment 6 delivers disk-backed store-and-forward queue (64-entry ring buffer), hub ACK frames, hub→agent command channel (`audit_now`, `config_update`, `graceful_restart`), and `POST /nodes/{id}/audit_now` + `POST /nodes/{id}/config` API endpoints.
 
-**Known gap (fix before Increment 7):** `config_update` command loses `playbook_path`/`interval_sec` parameters — hub command queue stores only the command string. The `command.Queue` needs to carry a structured payload, or the parameters need a separate store.
-
-**Next:** Increment 7 scope TBD. Candidates: fix config_update parameter passing, Ansible baseline git-pull sync, multi-node hub HA (Postgres migration seam), NetBox inventory reader, per-node ingest rate limiting.
+**Next:** Increment 7 scope TBD. Candidates: Ansible baseline git-pull sync, multi-node hub HA (Postgres migration seam), NetBox inventory reader, per-node ingest rate limiting, TLS cert rotation without restart.
 
 **Open questions:**
 - Tiger Style in PROJECT.md marked "active for this session" — keep as permanent project constraint, update wording, or drop?
@@ -114,5 +112,5 @@ _Goal: agent survives extended hub outages; hub can trigger on-demand audits wit
 - [x] Agent startup: replay unsent queue entries before entering normal loop
 - [x] Hub API: `POST /nodes/{id}/audit_now` — enqueues a `PayloadTypeCommand{type:"audit_now"}` frame, delivered on next heartbeat ACK
 - [x] Agent: on receiving `audit_now` command, drain audit timer and run immediately
-- [x] Hub API: `POST /nodes/{id}/config` — push updated baseline playbook path or interval override (⚠ parameters not yet passed through command queue — see Known gap above)
+- [x] Hub API: `POST /nodes/{id}/config` — push updated baseline playbook path or interval override
 - [x] Agent: `SIGTERM` from hub command (`graceful_restart`) — clean shutdown, systemd restarts

@@ -120,15 +120,19 @@ func (l *Listener) sendHeartbeatResponse(conn net.Conn, node_id string) {
 	}
 
 	if l.cmdq != nil {
-		if cmd_str, ok := l.cmdq.Pop(node_id); ok {
-			frame, err := wire.BuildCommandFrame(wire.CommandPayload{Command: cmd_str})
+		if entry, ok := l.cmdq.Pop(node_id); ok {
+			frame, err := wire.BuildCommandFrame(wire.CommandPayload{
+				Command:      entry.Command,
+				PlaybookPath: entry.PlaybookPath,
+				IntervalSec:  entry.IntervalSec,
+			})
 			if err != nil {
 				log.Printf("ingest: build command frame for %q: %v", node_id, err)
 			} else {
 				if _, err := conn.Write(frame); err != nil {
-					log.Printf("ingest: write command %q to %q: %v", cmd_str, node_id, err)
+					log.Printf("ingest: write command %q to %q: %v", entry.Command, node_id, err)
 				} else {
-					log.Printf("ingest: delivered command %q to node %s", cmd_str, node_id)
+					log.Printf("ingest: delivered command %q to node %s", entry.Command, node_id)
 				}
 				return
 			}
