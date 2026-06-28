@@ -2,9 +2,11 @@
 
 ## Now
 
-**State:** Increments 1–5 fully implemented and end-to-end tested on Colima dev VM. Drift detection pipeline verified: `make dev-drift` → audit cycle → `DRIFT_DETECTED` in hub → `make dev-restore` → `OK` → alert cleared. All production deployment artifacts (bootstrap playbooks, systemd unit, logrotate) correct and deployed. Increment 6 (resilience + remote control) is designed (D-13 through D-19 in DECISIONS.md) and partially stubbed (`PayloadTypeAck`/`PayloadTypeCommand` reserved in wire).
+**State:** Increments 1–6 fully implemented. Increment 6 delivers disk-backed store-and-forward queue (64-entry ring buffer), hub ACK frames, hub→agent command channel (`audit_now`, `config_update`, `graceful_restart`), and `POST /nodes/{id}/audit_now` + `POST /nodes/{id}/config` API endpoints.
 
-**Next:** Run `/ds-project-map` to refresh PROJECT.md (stale: Go version, CPUQuota/MemoryMax values, missing packages, deploy/ansible description). Then start Increment 6 implementation — begin with `internal/agent/queue` (disk-backed ring buffer, D-13).
+**Known gap (fix before Increment 7):** `config_update` command loses `playbook_path`/`interval_sec` parameters — hub command queue stores only the command string. The `command.Queue` needs to carry a structured payload, or the parameters need a separate store.
+
+**Next:** Increment 7 scope TBD. Candidates: fix config_update parameter passing, Ansible baseline git-pull sync, multi-node hub HA (Postgres migration seam), NetBox inventory reader, per-node ingest rate limiting.
 
 **Open questions:**
 - Tiger Style in PROJECT.md marked "active for this session" — keep as permanent project constraint, update wording, or drop?
@@ -98,7 +100,7 @@ _Goal: deployable to a real fleet subset via staged Ansible rollout._
 - [x] `audit.Probe()`: startup smoke check — runs `ansible-playbook --version` once; emits `AUDIT_ERROR` to hub immediately if ansible is broken in service environment
 - [x] `audit.Run()`: writes `/var/lib/fiia/.ansible/audit.cfg` before each invocation (gathering=explicit, tmp paths) — no dependency on bootstrap-deployed file
 - [x] `audit.Run()`: logs elapsed wall-clock time on timeout and completion for CPUQuota diagnostics
-- [ ] End-to-end test on staging fleet: deploy to 5% batch, confirm no P99 latency regression, heartbeats in Grafana
+- [ ] End-to-end test on staging fleet: deploy to 5% batch, confirm no P99 latency regression, heartbeats in Grafana _(operational — not a code task)_
 
 ---
 
@@ -106,11 +108,11 @@ _Goal: deployable to a real fleet subset via staged Ansible rollout._
 _Goal: agent survives extended hub outages; hub can trigger on-demand audits without waiting for the timer._
 
 - [x] `wire`: add `PayloadTypeCommand` and `PayloadTypeAck` frame types (hub→agent direction, reserved — not yet consumed)
-- [ ] `internal/hub/ingest`: send `PayloadTypeAck` frame after storing each heartbeat
-- [ ] `internal/agent/transport`: read one optional response frame after each heartbeat send (short timeout; ignore if none)
-- [ ] `internal/agent/queue`: disk-backed ring buffer (64 entries, msgpack, `/var/lib/fiia/queue/`) — write before send, advance read pointer on ACK
-- [ ] Agent startup: replay unsent queue entries before entering normal loop
-- [ ] Hub API: `POST /nodes/{id}/audit_now` — enqueues a `PayloadTypeCommand{type:"audit_now"}` frame, delivered on next heartbeat ACK
-- [ ] Agent: on receiving `audit_now` command, drain audit timer and run immediately
-- [ ] Hub API: `POST /nodes/{id}/config` — push updated baseline playbook path or interval override
-- [ ] Agent: `SIGTERM` from hub command (`graceful_restart`) — clean shutdown, systemd restarts
+- [x] `internal/hub/ingest`: send `PayloadTypeAck` frame after storing each heartbeat
+- [x] `internal/agent/transport`: read one optional response frame after each heartbeat send (short timeout; ignore if none)
+- [x] `internal/agent/queue`: disk-backed ring buffer (64 entries, msgpack, `/var/lib/fiia/queue/`) — write before send, advance read pointer on ACK
+- [x] Agent startup: replay unsent queue entries before entering normal loop
+- [x] Hub API: `POST /nodes/{id}/audit_now` — enqueues a `PayloadTypeCommand{type:"audit_now"}` frame, delivered on next heartbeat ACK
+- [x] Agent: on receiving `audit_now` command, drain audit timer and run immediately
+- [x] Hub API: `POST /nodes/{id}/config` — push updated baseline playbook path or interval override (⚠ parameters not yet passed through command queue — see Known gap above)
+- [x] Agent: `SIGTERM` from hub command (`graceful_restart`) — clean shutdown, systemd restarts
