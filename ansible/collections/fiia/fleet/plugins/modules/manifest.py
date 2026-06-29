@@ -39,6 +39,16 @@ options:
     type: list
     elements: raw
     default: []
+  mode:
+    description: >
+      Check mode. C(declared) (default) checks only the listed files, packages,
+      and services. C(snapshot) additionally records all installed packages and
+      all active services at provisioning time; the agent reports any unauthorized
+      additions detected at audit time as C(pkg:unauthorized:<name>) or
+      C(svc:unauthorized:<name>) deviations.
+    type: str
+    choices: [declared, snapshot]
+    default: declared
 requirements:
   - dpkg-query (Debian/Ubuntu) or rpm (RHEL/CentOS) for package checks
   - systemctl for service checks
@@ -80,6 +90,7 @@ import os
 import stat
 import subprocess
 import time
+from shutil import which
 
 from ansible.module_utils.basic import AnsibleModule
 
@@ -126,6 +137,51 @@ def service_states(name):
     running = run(['systemctl', 'is-active', '--quiet', name])
     enabled = run(['systemctl', 'is-enabled', '--quiet', name])
     return running, enabled
+
+
+def list_installed_packages():
+    """Return sorted list of all installed package names. dpkg first, rpm fallback."""
+    if which('dpkg-query'):
+        try:
+            out = subprocess.check_output(
+                ['dpkg-query', '-W', '-f=${Package}\n'], stderr=subprocess.DEVNULL,
+            ).decode()
+            return sorted(l.strip() for l in out.splitlines() if l.strip())
+        except subprocess.CalledProcessError:
+            pass
+    if which('rpm'):
+        try:
+            out = subprocess.check_output(
+                ['rpm', '-qa', '--qf', '%{NAME}\n'], stderr=subprocess.DEVNULL,
+            ).decode()
+            return sorted(l.strip() for l in out.splitlines() if l.strip())
+        except subprocess.CalledProcessError:
+            pass
+    return []
+
+
+def list_active_services():
+    """Return sorted list of active service names via systemctl."""
+    if not which('systemctl'):
+        return []
+    try:
+        out = subprocess.check_output(
+            ['systemctl', 'list-units', '--type=service', '--state=active',
+             '--no-pager', '--no-legend', '--plain'],
+            stderr=subprocess.DEVNULL,
+        ).decode()
+        svcs = []
+        for line in out.splitlines():
+            parts = line.split()
+            if parts:
+                name = parts[0]
+                if name.endswith('.service'):
+                    name = name[:-8]
+                if name:
+                    svcs.append(name)
+        return sorted(svcs)
+    except subprocess.CalledProcessError:
+        return []
 
 
 def build_manifest(params):
@@ -181,6 +237,10 @@ def build_manifest(params):
         if want_enabled and not enabled:
             warnings.append('service not enabled at provisioning time: {}'.format(name))
 
+    if params.get('mode') == 'snapshot':
+        manifest['package_snapshot'] = list_installed_packages()
+        manifest['service_snapshot'] = list_active_services()
+
     return manifest, warnings
 
 
@@ -200,6 +260,7 @@ def main():
             files=dict(type='list', elements='str', default=[]),
             packages=dict(type='list', elements='raw', default=[]),
             services=dict(type='list', elements='raw', default=[]),
+            mode=dict(type='str', default='declared', choices=['declared', 'snapshot']),
         ),
         supports_check_mode=True,
     )

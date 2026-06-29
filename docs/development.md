@@ -27,7 +27,7 @@ That's it. `dev-init` is a one-shot; skip it on subsequent sessions — just `ma
 make dev-run           # systemctl status fiia-agent in VM
 curl http://localhost:9091/nodes
 curl http://localhost:9091/nodes/<node-id>/status   # node-id: run dev/vm.sh node-id
-curl http://localhost:9090/metrics | grep fiia_nodes_alive
+curl http://localhost:9091/metrics | grep fiia_nodes_alive
 ```
 
 ### Test drift detection
@@ -54,6 +54,7 @@ Requires Docker. Installs `community.docker` ansible collection automatically if
 ```
 build                   build fiia-agent and fiia-hub for host OS
 test                    run go test ./...
+test-linux              cross-compile tests + run on VM (or local on Linux); pass ARGS="./pkg -v"
 
 dev-init                first-time setup: detect backend, create VM, start VM
 dev-setup               detect VM backend only (writes dev/.backend)
@@ -89,14 +90,18 @@ dev-check-drift         query hub: node status, drift events, alerts
 | `GET` | `/nodes/{id}/status` | Single node status |
 | `GET` | `/nodes/{id}/drift` | Last 50 drift events |
 | `GET` | `/alerts` | All active alerts |
-| `POST` | `/nodes/{id}/audit` | Trigger immediate audit |
+| `POST` | `/nodes/{id}/audit_now` | Trigger immediate audit |
 | `POST` | `/nodes/{id}/config` | Push config update |
+| `POST` | `/nodes/{id}/enroll` | Generate HMAC secret; requires `Authorization: Bearer <enrollment_token>`; returns `{"node_id","secret"}` |
+
+The enrollment endpoint is only registered when `enrollment_token` is set in hub.toml.
 
 ### Alert types
 
 | Alert | Raised when | Cleared when |
 |-------|-------------|--------------|
 | `DRIFT_DETECTED` | Manifest check finds deviations | Next clean audit |
+| `MANIFEST_STALE` | `manifest.generated_at` older than 90 days | Next audit with fresh manifest |
 | `HMAC_MISMATCH` | Frame received with invalid HMAC | Manual |
 | `AGENT_PAUSED` | Node silent > paused threshold | Next heartbeat |
 | `AGENT_UNREACHABLE` | Node silent > unreachable threshold | Next heartbeat |
@@ -104,7 +109,7 @@ dev-check-drift         query hub: node status, drift events, alerts
 
 ## Prometheus metrics
 
-Scraped at `:9090/metrics`.
+Scraped at `:9091/metrics` (same port as REST API).
 
 | Metric | Description |
 |--------|-------------|
@@ -141,6 +146,25 @@ queue_dir             = "/var/lib/fiia/queue"
 
 `manifest_path` takes precedence over `ansible_playbook_path`. Generate the manifest with `fiia.fleet.manifest` as the last task in your provisioning play.
 
+The module supports two modes via the `mode` parameter:
+
+| Mode | Behaviour |
+|------|-----------|
+| `declared` (default) | Checks only listed files, packages, and services |
+| `snapshot` | Also records all installed packages and all active services; agent flags any additions at audit time as `pkg:unauthorized:<name>` or `svc:unauthorized:<name>` |
+
+```yaml
+- name: Update fiia drift manifest
+  fiia.fleet.manifest:
+    mode: snapshot          # record full package + service list at provision time
+    files:
+      - /etc/nginx/nginx.conf
+    packages:
+      - nginx
+    services:
+      - nginx
+```
+
 ### Hub — `/etc/fiia/hub.toml`
 
 ```toml
@@ -153,12 +177,29 @@ db_driver     = "sqlite"                    # "sqlite" | "postgres"
 db_path       = "/var/lib/fiia/hub.db"
 # db_dsn      = "postgres://fiia:pass@localhost:5432/fiia?sslmode=require"
 
-metrics_addr  = "127.0.0.1:9090"
-api_addr      = "127.0.0.1:9091"
+api_addr      = "127.0.0.1:9091"   # serves /nodes /alerts /metrics /healthz
 
 # inventory_csv_path     = "/etc/fiia/inventory.csv"
 # reconcile_interval_sec = 3600
+
+# enrollment_token = "change-me"        # enables POST /nodes/{id}/enroll (ansible bootstrap uses this)
+# alert_webhook_url = "https://..."     # JSON push on every alert set/clear (Slack, PagerDuty, Grafana)
 ```
+
+#### Webhook payload
+
+When `alert_webhook_url` is set, the hub fires an async `POST application/json` on every alert set or clear:
+
+```json
+{
+  "node_id":    "web-01",
+  "alert_type": "DRIFT_DETECTED",
+  "action":     "set",
+  "timestamp":  1719619200
+}
+```
+
+`action` is `"set"` or `"clear"`. Covered alerts: `DRIFT_DETECTED`, `MANIFEST_STALE`, `HMAC_MISMATCH`.
 
 ## Production deployment
 

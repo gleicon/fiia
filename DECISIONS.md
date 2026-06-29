@@ -270,6 +270,66 @@
 
 ---
 
+## D-24: Single HTTP port for REST API, metrics, and health
+
+**Question:** Should `/metrics` and `/healthz` run on a separate port from the REST API?
+
+**Decision:** **Single port.** `api_addr` serves the REST API, `/metrics`, and `/healthz`. No separate `metrics_addr`.
+
+**Rationale:** `/metrics` is just a URL path — it requires no separate listener. Two ports add firewall rules, two scrape targets in Prometheus, and two service entries in every deploy manifest. `WithMetrics(prometheus.Gatherer)` builder registers the routes on the existing mux; tests that don't call `WithMetrics` are unaffected.
+
+**Implication:** `MetricsAddr` removed from `HubConfig`. `internal/hub/metrics` registers gauges and collectors; it does not start a server. `cmd/hub` passes `prometheus.DefaultGatherer` to `api.Server.WithMetrics`.
+
+---
+
+## D-25: Node enrollment API
+
+**Question:** The bootstrap playbook must pre-seed HMAC secrets via `--seed-node` CLI flag. Should the hub expose an enrollment endpoint so the playbook can request a secret instead?
+
+**Decision:** **Optional `POST /nodes/{id}/enroll` endpoint**, gated on `enrollment_token` in hub.toml. Hub generates a 32-byte HMAC secret and returns it as hex; ansible role stores it in `agent.toml`. Disabled when `enrollment_token` is absent.
+
+**Rationale:** Pre-seeding via `--seed-node` requires the operator to manage secret generation and flag assembly outside ansible. Enrollment lets the playbook be self-contained: call the endpoint, receive the secret, write the config — no operator ceremony. The token is a simple shared secret (suitable for an intranet bootstrap flow); SPIFFE/SPIRE remains the long-term direction.
+
+**Implication:** `POST /nodes/{id}/enroll` registered in `api.Server.ServeListener` only when `enrollmentToken != ""`. Returns `{"node_id","secret"}`. No unauthenticated access; `Authorization: Bearer <token>` required.
+
+---
+
+## D-26: Webhook push on alert set/clear
+
+**Question:** Operators use existing alerting tools (Slack, PagerDuty, Grafana Alertmanager). Should the hub push events rather than wait for Prometheus scraping?
+
+**Decision:** **Optional `alert_webhook_url` config field.** On every synchronous alert set or clear (`DRIFT_DETECTED`, `MANIFEST_STALE`, `HMAC_MISMATCH`), the hub fires an async goroutine POSTing JSON to the configured URL. No retry — fire-and-forget. Disabled when the field is absent.
+
+**Rationale:** Prometheus scraping is pull-based; alert state changes may be missed between scrapes. A webhook push has sub-second latency and requires no Prometheus alerting rules. Fire-and-forget is acceptable: the hub's alert table is the authoritative state; if a webhook fails, the next scrape still surfaces the alert. We do not implement retry queuing to avoid adding complexity and persistence concerns.
+
+**Implication:** Async goroutine; ingest hot path is never blocked. Only synchronous alert paths covered. Async-batched clears (`AGENT_UNREACHABLE`, `AGENT_PAUSED`) are out of scope for webhooks.
+
+---
+
+## D-27: Manifest snapshot mode for unauthorized change detection
+
+**Question:** `declared` mode only checks listed items. Unauthorized package installs or service starts go undetected. Should the manifest track the full state?
+
+**Decision:** **`mode: snapshot` added to `fiia.fleet.manifest` ansible module.** At provision time, records all installed packages (`dpkg-query` / `rpm`) and all active services (`systemctl list-units`). At audit time, agent compares current state to snapshot; additions are flagged as `pkg:unauthorized:<name>` or `svc:unauthorized:<name>`.
+
+**Rationale:** Teams track declared packages and services but want to catch manual installs and rogue services without a separate security scanner. Snapshot at provision time is the right moment: it reflects post-apply desired state. `declared` mode remains the default — `snapshot` is opt-in because on large systems the snapshot list can be hundreds of entries.
+
+**Implication:** `PackageSnapshot` and `ServiceSnapshot` fields added to manifest JSON and `Manifest` struct. `checkUnauthorizedPackages` / `checkUnauthorizedServices` functions on Linux; no-op stubs on other platforms.
+
+---
+
+## D-28: MANIFEST_STALE alert
+
+**Question:** If the manifest is never regenerated after provisioning, drift detection silently degrades (packages installed months ago are not in the snapshot; declared files may have changed). Should the hub detect this?
+
+**Decision:** **Hub raises `MANIFEST_STALE` when `ManifestGeneratedAt` is older than 90 days.** Agent includes `manifest_generated_at` in every `DriftPayload`. Hub checks the age on every drift report; alert clears automatically once the manifest is regenerated.
+
+**Rationale:** 90 days is a reasonable reprovisioning window for most fleets. The check costs nothing: the timestamp is already in the payload. Alert clears on next drift report after regeneration — no operator action required beyond re-running the provisioning play.
+
+**Implication:** `ManifestGeneratedAt int64` added to `wire.DriftPayload` (msgpack `omitempty`). Hub sets/clears `MANIFEST_STALE` in `ingest.routeDrift`. Webhook push fires on both state changes.
+
+---
+
 ## D-23: Async write queue for hub ingest hot path
 
 **Question:** At high node density (1000+ nodes, sub-second heartbeat intervals), synchronous DB writes in the per-connection goroutine become the throughput ceiling. How should the hub decouple ingest throughput from DB write latency?

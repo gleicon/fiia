@@ -1,4 +1,4 @@
-.PHONY: build test lint \
+.PHONY: build test test-linux lint \
         dev-init dev-setup dev-vm-create dev-vm-start dev-vm-stop dev-vm-status \
         dev-build dev-certs dev-certs-force \
         dev-inventory dev-hub dev-deploy dev-run dev-logs dev-drift-log \
@@ -12,6 +12,9 @@ build:
 
 test:
 	go test ./...
+
+test-linux:
+	dev/test-linux.sh $(ARGS)
 
 # ── VM backend ─────────────────────────────────────────────────────────────────
 # Backend is detected once by running: make dev-setup

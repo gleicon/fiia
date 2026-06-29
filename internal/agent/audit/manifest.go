@@ -41,11 +41,13 @@ type ManifestService struct {
 
 // Manifest is the desired-state document written by the ansible module and read by the agent.
 type Manifest struct {
-	SchemaVersion int               `json:"schema_version"`
-	GeneratedAt   int64             `json:"generated_at"`
-	Files         []ManifestFile    `json:"files"`
-	Packages      []ManifestPackage `json:"packages"`
-	Services      []ManifestService `json:"services"`
+	SchemaVersion   int               `json:"schema_version"`
+	GeneratedAt     int64             `json:"generated_at"`
+	Files           []ManifestFile    `json:"files"`
+	Packages        []ManifestPackage `json:"packages"`
+	Services        []ManifestService `json:"services"`
+	PackageSnapshot []string          `json:"package_snapshot,omitempty"` // all packages at provision time (mode: snapshot)
+	ServiceSnapshot []string          `json:"service_snapshot,omitempty"` // all active services at provision time (mode: snapshot)
 }
 
 // RunManifest reads the manifest at cfg.ManifestPath, checks live system state,
@@ -76,10 +78,14 @@ func RunManifest(cfg *agentcfg.AgentConfig) (wire.DriftPayload, bool) {
 		}
 	}
 
+	payload.ManifestGeneratedAt = m.GeneratedAt
+
 	var deviations []string
 	deviations = append(deviations, checkFiles(m.Files)...)
 	deviations = append(deviations, checkPackages(m.Packages)...)
 	deviations = append(deviations, checkServices(m.Services)...)
+	deviations = append(deviations, checkUnauthorizedPackages(m.PackageSnapshot)...)
+	deviations = append(deviations, checkUnauthorizedServices(m.ServiceSnapshot)...)
 
 	if len(deviations) > 0 {
 		payload.Status = "DRIFT_DETECTED"

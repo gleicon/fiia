@@ -1,13 +1,16 @@
 package ingest
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +76,7 @@ type Listener struct {
 	limiters      sync.Map // node_id → *rate.Limiter
 	write_ch      chan dbWriteOp
 	dummy_secret  [32]byte // random; replaces real secret for unknown nodes to prevent timing oracle
+	webhookURL    string   // optional; if set, alert set/clear fires an async HTTP POST
 }
 
 func assert(condition bool, message string) {
@@ -108,6 +112,40 @@ func New(tls_cfg *tls.Config, reg *registry.Registry, s store.Store, drift_count
 		write_ch:      make(chan dbWriteOp, write_ch_cap),
 		dummy_secret:  dummy,
 	}
+}
+
+// WithWebhook enables async HTTP POST on every alert set/clear.
+// The payload is JSON: {"node_id","alert_type","action","timestamp"}.
+// Pass "" to disable (default).
+func (l *Listener) WithWebhook(url string) *Listener {
+	l.webhookURL = url
+	return l
+}
+
+// fireWebhook posts an alert event to the configured webhook URL in a goroutine.
+// action is "set" or "clear". No-op when webhookURL is empty.
+func (l *Listener) fireWebhook(node_id, alert_type, action string, ts int64) {
+	if l.webhookURL == "" {
+		return
+	}
+	url := l.webhookURL
+	go func() {
+		body, _ := json.Marshal(map[string]any{
+			"node_id":    node_id,
+			"alert_type": alert_type,
+			"action":     action,
+			"timestamp":  ts,
+		})
+		resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+		if err != nil {
+			log.Printf("ingest: webhook POST: %v", err)
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			log.Printf("ingest: webhook returned %d for node=%s alert=%s", resp.StatusCode, node_id, alert_type)
+		}
+	}()
 }
 
 // getLimiter returns the rate.Limiter for node_id, creating one on first access.
@@ -363,8 +401,11 @@ func (l *Listener) processFrame(body_bytes []byte, remote_addr string) (string, 
 		if known {
 			log.Printf("SECURITY: ingest: HMAC mismatch for node %q from %s — dropping payload", node_id, remote_addr)
 			// Security alert is written synchronously — never batched.
-			if err := l.store.SetAlert(node_id, "HMAC_MISMATCH", time.Now().Unix()); err != nil {
+			now := time.Now().Unix()
+			if err := l.store.SetAlert(node_id, "HMAC_MISMATCH", now); err != nil {
 				log.Printf("ingest: set HMAC_MISMATCH alert for %q: %v", node_id, err)
+			} else {
+				l.fireWebhook(node_id, "HMAC_MISMATCH", "set", now)
 			}
 		} else {
 			log.Printf("ingest: unknown node %q from %s", node_id, remote_addr)
@@ -422,10 +463,35 @@ func (l *Listener) routeDrift(payload_bytes []byte, node_id string) {
 	case "DRIFT_DETECTED":
 		if err := l.store.SetAlert(p.NodeID, "DRIFT_DETECTED", p.TimestampUnix); err != nil {
 			log.Printf("ingest: set DRIFT_DETECTED alert for %q: %v", p.NodeID, err)
+		} else {
+			l.fireWebhook(p.NodeID, "DRIFT_DETECTED", "set", p.TimestampUnix)
 		}
 	case "OK":
 		if err := l.store.ClearAlert(p.NodeID, "DRIFT_DETECTED"); err != nil {
 			log.Printf("ingest: clear DRIFT_DETECTED alert for %q: %v", p.NodeID, err)
+		} else {
+			l.fireWebhook(p.NodeID, "DRIFT_DETECTED", "clear", p.TimestampUnix)
+		}
+	}
+
+	// Raise MANIFEST_STALE when the manifest has not been regenerated within 90 days.
+	// Hub owns time-based alerting; agent sends ManifestGeneratedAt on every drift report.
+	if p.ManifestGeneratedAt > 0 {
+		const manifest_stale_days = 90
+		age_days := (time.Now().Unix() - p.ManifestGeneratedAt) / 86400
+		if age_days > manifest_stale_days {
+			if err := l.store.SetAlert(p.NodeID, "MANIFEST_STALE", p.TimestampUnix); err != nil {
+				log.Printf("ingest: set MANIFEST_STALE for %q: %v", p.NodeID, err)
+			} else {
+				l.fireWebhook(p.NodeID, "MANIFEST_STALE", "set", p.TimestampUnix)
+			}
+			log.Printf("ingest: manifest stale node=%s age_days=%d", p.NodeID, age_days)
+		} else {
+			if err := l.store.ClearAlert(p.NodeID, "MANIFEST_STALE"); err != nil {
+				log.Printf("ingest: clear MANIFEST_STALE for %q: %v", p.NodeID, err)
+			} else {
+				l.fireWebhook(p.NodeID, "MANIFEST_STALE", "clear", p.TimestampUnix)
+			}
 		}
 	}
 }

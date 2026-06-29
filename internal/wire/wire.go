@@ -46,14 +46,15 @@ type HeartbeatPayload struct {
 	Metrics       USEMetrics `msgpack:"metrics"`
 }
 
-// DriftPayload reports configuration drift detected by ansible-playbook --check.
+// DriftPayload reports configuration drift from a manifest check or ansible-playbook --check.
 type DriftPayload struct {
-	SchemaVersion uint8    `msgpack:"schema_version"`
-	PayloadType   uint8    `msgpack:"payload_type"`
-	NodeID        string   `msgpack:"node_id"`
-	TimestampUnix int64    `msgpack:"timestamp_unix"`
-	Status        string   `msgpack:"status"`
-	TasksChanged  []string `msgpack:"tasks_changed"`
+	SchemaVersion       uint8    `msgpack:"schema_version"`
+	PayloadType         uint8    `msgpack:"payload_type"`
+	NodeID              string   `msgpack:"node_id"`
+	TimestampUnix       int64    `msgpack:"timestamp_unix"`
+	Status              string   `msgpack:"status"`
+	TasksChanged        []string `msgpack:"tasks_changed"`
+	ManifestGeneratedAt int64    `msgpack:"manifest_generated_at,omitempty"` // unix epoch when manifest was written
 }
 
 func assert(condition bool, message string) {

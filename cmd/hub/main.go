@@ -77,18 +77,16 @@ func main() {
 
 	var drift_counter atomic.Int64
 	cmdq := command.New()
-	metrics_srv := metrics.New(reg, db, &drift_counter,
+	metrics.New(reg, db, &drift_counter,
 		prometheus.DefaultRegisterer, prometheus.DefaultGatherer)
-	api_srv := hubapi.New(db, cmdq)
-	ingest_l := ingest.New(tls_cfg, reg, db, &drift_counter, cmdq, cfg.RateLimitRPS, cfg.RateLimitBurst)
+	api_srv := hubapi.New(db, cmdq).
+		WithMetrics(prometheus.DefaultGatherer).
+		WithEnrollmentToken(cfg.EnrollmentToken)
+	ingest_l := ingest.New(tls_cfg, reg, db, &drift_counter, cmdq, cfg.RateLimitRPS, cfg.RateLimitBurst).
+		WithWebhook(cfg.WebhookURL)
 
 	stop_ch := make(chan struct{})
 
-	go func() {
-		if err := metrics_srv.Serve(cfg.MetricsAddr); err != nil {
-			log.Printf("hub: metrics server error: %v", err)
-		}
-	}()
 	go func() {
 		if err := api_srv.Serve(cfg.APIAddr); err != nil {
 			log.Printf("hub: api server error: %v", err)
@@ -106,7 +104,7 @@ func main() {
 		go inventory.RunReconciler(csv_reader, reg, db, cfg.ReconcileIntervalSec, stop_ch)
 	}
 
-	log.Printf("hub: started (listen=%s metrics=%s api=%s)", cfg.ListenAddr, cfg.MetricsAddr, cfg.APIAddr)
+	log.Printf("hub: started (ingest=%s api=%s  /metrics and /healthz on api port)", cfg.ListenAddr, cfg.APIAddr)
 
 	sig_ch := make(chan os.Signal, 1)
 	signal.Notify(sig_ch, syscall.SIGTERM, syscall.SIGINT)
