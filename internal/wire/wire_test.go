@@ -1,8 +1,11 @@
 package wire
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func TestEncodeDecodeHeartbeat(t *testing.T) {
@@ -141,18 +144,23 @@ func TestBuildFrameSplitFrame(t *testing.T) {
 }
 
 func TestDecodeHeartbeatUnknownSchema(t *testing.T) {
-	// Manually craft a payload with wrong schema version.
-	bad_payload := HeartbeatPayload{
+	bad := HeartbeatPayload{
 		SchemaVersion: 99,
-		NodeID:        "bad-node",
+		PayloadType:   PayloadTypeHeartbeat,
+		NodeID:        "bad-schema-node",
 		TimestampUnix: time.Now().Unix(),
 		Status:        "OK",
 	}
-	// Encode bypassing our EncodeHeartbeat to inject the bad version.
-	import_msgpack := func() {}
-	_ = import_msgpack // silence unused
+	data, err := msgpack.Marshal(bad)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
 
-	// Use raw msgpack to encode the bad payload.
-	// We test that DecodeHeartbeat rejects unknown schema versions.
-	_ = bad_payload // tested indirectly via integration; schema override not exposed here
+	_, decode_err := DecodeHeartbeat(data)
+	if decode_err == nil {
+		t.Fatal("DecodeHeartbeat: expected error for unknown schema version, got nil")
+	}
+	if !strings.Contains(decode_err.Error(), "unsupported schema version") {
+		t.Errorf("error should mention 'unsupported schema version', got: %v", decode_err)
+	}
 }

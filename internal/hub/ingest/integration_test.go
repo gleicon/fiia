@@ -331,6 +331,136 @@ func TestIntegrationRateLimit(t *testing.T) {
 	}
 }
 
+// TestIntegrationHMACMismatch verifies that a frame with a valid node_id but wrong HMAC
+// is dropped, the connection gets no ACK, and an HMAC_MISMATCH alert is set in the store.
+func TestIntegrationHMACMismatch(t *testing.T) {
+	server_tls, ca_pool := genTestTLS(t)
+
+	db_path := filepath.Join(t.TempDir(), "hmac_test.db")
+	s, err := store.NewSQLiteStore(db_path)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	node_id := "hmac-node-1"
+	real_secret := []byte("hmac-real-secret-32bytes-exactly")
+	wrong_secret := []byte("hmac-wrng-secret-32bytes-exactly")
+	if err := s.SetNodeSecret(node_id, real_secret); err != nil {
+		t.Fatalf("set node secret: %v", err)
+	}
+
+	reg := registry.New(s)
+	ingest_l := ingest.New(server_tls, reg, s, nil, nil, 100.0, 10)
+
+	ingest_ln, err := tls.Listen("tcp", "127.0.0.1:0", server_tls)
+	if err != nil {
+		t.Fatalf("tls listen: %v", err)
+	}
+	go ingest_l.ServeListener(ingest_ln) //nolint:errcheck
+
+	payload, err := wire.EncodeHeartbeat(wire.HeartbeatPayload{
+		NodeID:        node_id,
+		TimestampUnix: time.Now().Unix(),
+		Status:        "OK",
+	})
+	if err != nil {
+		t.Fatalf("encode heartbeat: %v", err)
+	}
+	// Sign with wrong_secret — hub knows real_secret, so Verify fails.
+	frame := wire.BuildFrame(wrong_secret, payload)
+
+	client_tls := &tls.Config{RootCAs: ca_pool, MinVersion: tls.VersionTLS13}
+	conn, err := tls.Dial("tcp", ingest_ln.Addr().String(), client_tls)
+	if err != nil {
+		t.Fatalf("dial hub: %v", err)
+	}
+	if _, err := conn.Write(frame); err != nil {
+		conn.Close()
+		t.Fatalf("write frame: %v", err)
+	}
+	var ack [5]byte
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+	_, read_err := io.ReadFull(conn, ack[:])
+	conn.Close()
+	if read_err == nil {
+		t.Fatal("expected no ACK for HMAC mismatch, but read succeeded")
+	}
+
+	// Alert must be set in the store.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		alerts, _ := s.GetAlerts()
+		for _, a := range alerts {
+			if a.NodeID == node_id && a.AlertType == "HMAC_MISMATCH" {
+				return // pass
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("HMAC_MISMATCH alert not set after mismatch frame")
+}
+
+// TestIntegrationUnknownNode verifies that a frame from an unregistered node_id
+// is silently dropped (no ACK) and no alert is written to the store.
+func TestIntegrationUnknownNode(t *testing.T) {
+	server_tls, ca_pool := genTestTLS(t)
+
+	db_path := filepath.Join(t.TempDir(), "unknown_test.db")
+	s, err := store.NewSQLiteStore(db_path)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	reg := registry.New(s)
+	ingest_l := ingest.New(server_tls, reg, s, nil, nil, 100.0, 10)
+
+	ingest_ln, err := tls.Listen("tcp", "127.0.0.1:0", server_tls)
+	if err != nil {
+		t.Fatalf("tls listen: %v", err)
+	}
+	go ingest_l.ServeListener(ingest_ln) //nolint:errcheck
+
+	// node_id not registered in store; any secret will fail Verify.
+	payload, err := wire.EncodeHeartbeat(wire.HeartbeatPayload{
+		NodeID:        "ghost-node-never-registered",
+		TimestampUnix: time.Now().Unix(),
+		Status:        "OK",
+	})
+	if err != nil {
+		t.Fatalf("encode heartbeat: %v", err)
+	}
+	frame := wire.BuildFrame([]byte("some-secret-32-bytes-exactly!!!!"), payload)
+
+	client_tls := &tls.Config{RootCAs: ca_pool, MinVersion: tls.VersionTLS13}
+	conn, err := tls.Dial("tcp", ingest_ln.Addr().String(), client_tls)
+	if err != nil {
+		t.Fatalf("dial hub: %v", err)
+	}
+	if _, err := conn.Write(frame); err != nil {
+		conn.Close()
+		t.Fatalf("write frame: %v", err)
+	}
+	var ack [5]byte
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+	_, read_err := io.ReadFull(conn, ack[:])
+	conn.Close()
+	if read_err == nil {
+		t.Fatal("expected no ACK for unknown node, but read succeeded")
+	}
+
+	// No alert must be written for unknown nodes.
+	time.Sleep(100 * time.Millisecond)
+	alerts, err := s.GetAlerts()
+	if err != nil {
+		t.Fatalf("get alerts: %v", err)
+	}
+	if len(alerts) != 0 {
+		t.Errorf("unknown node: want no alerts, got %v", alerts)
+	}
+}
+
 // TestIntegrationInventoryReconciler verifies that nodes in the inventory CSV but
 // absent from the registry are flagged UNINSTRUMENTED_SERVER after reconciliation.
 func TestIntegrationInventoryReconciler(t *testing.T) {
