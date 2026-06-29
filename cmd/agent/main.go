@@ -48,7 +48,20 @@ func main() {
 
 	go heartbeat.Run(ctx, cfg, tr, audit_now_ch, cancel)
 
-	if cfg.AnsiblePlaybookPath != "" {
+	switch {
+	case cfg.ManifestPath != "":
+		if err := audit.ProbeManifest(cfg); err != nil {
+			log.Printf("agent: manifest probe failed — audit disabled: %v", err)
+			tr.SendAuditResult(wire.DriftPayload{
+				NodeID:        cfg.NodeID,
+				TimestampUnix: time.Now().Unix(),
+				Status:        "MANIFEST_NOT_FOUND",
+			})
+		} else {
+			log.Printf("agent: manifest-based drift check enabled (%s)", cfg.ManifestPath)
+			go runAuditLoop(ctx, cfg, tr, audit_now_ch)
+		}
+	case cfg.AnsiblePlaybookPath != "":
 		if err := audit.Probe(cfg); err != nil {
 			log.Printf("agent: ansible probe failed — audit disabled: %v", err)
 			tr.SendAuditResult(wire.DriftPayload{
@@ -83,7 +96,13 @@ func runAuditLoop(ctx context.Context, cfg *agentcfg.AgentConfig, tr *transport.
 		case <-time.After(sleep_duration):
 		}
 
-		p, ok := audit.Run(cfg)
+		var p wire.DriftPayload
+		var ok bool
+		if cfg.ManifestPath != "" {
+			p, ok = audit.RunManifest(cfg)
+		} else {
+			p, ok = audit.Run(cfg)
+		}
 		if !ok {
 			continue
 		}

@@ -24,6 +24,7 @@ type AgentConfig struct {
 	HeartbeatIntervalSec int
 	ConnectTimeoutSec    int
 	AnsiblePlaybookPath  string
+	ManifestPath         string
 	DriftLogPath         string
 	AuditIntervalSec     int
 	AuditJitterMaxSec    int
@@ -43,6 +44,7 @@ type agentSection struct {
 	HeartbeatIntervalSec int    `toml:"heartbeat_interval_sec"`
 	ConnectTimeoutSec    int    `toml:"connect_timeout_sec"`
 	AnsiblePlaybookPath  string `toml:"ansible_playbook_path"`
+	ManifestPath         string `toml:"manifest_path"`
 	DriftLogPath         string `toml:"drift_log_path"`
 	AuditIntervalSec     int    `toml:"audit_interval_sec"`
 	AuditJitterMaxSec    int    `toml:"audit_jitter_max_sec"`
@@ -91,6 +93,7 @@ func Load(path string) (*AgentConfig, error) {
 		HeartbeatIntervalSec: heartbeat_interval_sec_default,
 		ConnectTimeoutSec:    connect_timeout_sec_default,
 		AnsiblePlaybookPath:  raw.Agent.AnsiblePlaybookPath,
+		ManifestPath:         raw.Agent.ManifestPath,
 		DriftLogPath:         raw.Agent.DriftLogPath,
 		AuditIntervalSec:     audit_interval_sec_default,
 		AuditJitterMaxSec:    audit_jitter_max_sec_default,
