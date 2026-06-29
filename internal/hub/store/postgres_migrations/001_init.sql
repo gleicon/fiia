@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS nodes (
 
 CREATE TABLE IF NOT EXISTS node_secrets (
     node_id      TEXT   PRIMARY KEY,
-    secret_bytes BYTEA  NOT NULL,
+    secret_bytes BYTEA  NOT NULL CHECK (octet_length(secret_bytes) >= 16),
     created_unix BIGINT NOT NULL
 );
 

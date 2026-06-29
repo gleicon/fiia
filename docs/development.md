@@ -172,9 +172,20 @@ queue_dir             = "/var/lib/fiia/queue"    # disk queue for store-and-forw
 listen_addr   = ":9443"
 cert_path     = "/etc/fiia/hub_cert.pem"
 key_path      = "/etc/fiia/hub_key.pem"
-db_path       = "/var/lib/fiia/hub.db"
+
+# Storage — SQLite (default) or Postgres
+db_driver     = "sqlite"           # "sqlite" | "postgres"
+db_path       = "/var/lib/fiia/hub.db"  # used when db_driver = "sqlite"
+# db_dsn      = "postgres://fiia:pass@localhost:5432/fiia?sslmode=require"  # used when db_driver = "postgres"
+
 metrics_addr  = "127.0.0.1:9090"
 api_addr      = "127.0.0.1:9091"
+
+# Per-node ingest rate limiting (token bucket)
+# rate_limit_rps   = 1.0  # max heartbeats/second per node (default 1.0)
+# rate_limit_burst = 3    # burst allowance (default 3)
+
+# Inventory reconciliation
 # inventory_csv_path     = "/etc/fiia/inventory.csv"  # omit to disable reconciler
 # reconcile_interval_sec = 3600
 ```

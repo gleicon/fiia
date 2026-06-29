@@ -255,6 +255,82 @@ func TestIntegrationDriftPayload(t *testing.T) {
 	}
 }
 
+// TestIntegrationRateLimit verifies that a node exceeding rate_limit_rps gets its
+// connection dropped with no ACK, while the first frame within the limit is ACK'd.
+func TestIntegrationRateLimit(t *testing.T) {
+	server_tls, ca_pool := genTestTLS(t)
+
+	db_path := filepath.Join(t.TempDir(), "rate_test.db")
+	s, err := store.NewSQLiteStore(db_path)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	node_id := "rate-node-1"
+	secret := []byte("rate-hmac-secret-32bytes-exactly")
+	if err := s.SetNodeSecret(node_id, secret); err != nil {
+		t.Fatalf("set node secret: %v", err)
+	}
+
+	reg := registry.New(s)
+	// 0.1 RPS, burst 1: first frame consumes the only token; second is immediately dropped.
+	ingest_l := ingest.New(server_tls, reg, s, nil, nil, 0.1, 1)
+
+	ingest_ln, err := tls.Listen("tcp", "127.0.0.1:0", server_tls)
+	if err != nil {
+		t.Fatalf("tls listen: %v", err)
+	}
+	go ingest_l.ServeListener(ingest_ln) //nolint:errcheck
+
+	payload, err := wire.EncodeHeartbeat(wire.HeartbeatPayload{
+		NodeID:        node_id,
+		TimestampUnix: 1700000000,
+		Status:        "OK",
+	})
+	if err != nil {
+		t.Fatalf("encode heartbeat: %v", err)
+	}
+	frame := wire.BuildFrame(secret, payload)
+	client_tls := &tls.Config{RootCAs: ca_pool, MinVersion: tls.VersionTLS13}
+
+	// First frame: within rate limit → hub sends ACK (5 bytes: 4-byte len=1 + PayloadTypeAck).
+	conn1, err := tls.Dial("tcp", ingest_ln.Addr().String(), client_tls)
+	if err != nil {
+		t.Fatalf("dial hub (frame 1): %v", err)
+	}
+	if _, err := conn1.Write(frame); err != nil {
+		conn1.Close()
+		t.Fatalf("write frame 1: %v", err)
+	}
+	var ack [5]byte
+	conn1.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+	if _, err := io.ReadFull(conn1, ack[:]); err != nil {
+		conn1.Close()
+		t.Fatalf("read ACK for frame 1: %v", err)
+	}
+	conn1.Close()
+	if ack[4] != wire.PayloadTypeAck {
+		t.Errorf("frame 1: expected PayloadTypeAck (0x%02x), got 0x%02x", wire.PayloadTypeAck, ack[4])
+	}
+
+	// Second frame immediately: rate limit exceeded → hub closes connection with no response.
+	conn2, err := tls.Dial("tcp", ingest_ln.Addr().String(), client_tls)
+	if err != nil {
+		t.Fatalf("dial hub (frame 2): %v", err)
+	}
+	if _, err := conn2.Write(frame); err != nil {
+		conn2.Close()
+		t.Fatalf("write frame 2: %v", err)
+	}
+	conn2.SetReadDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+	_, read_err := io.ReadFull(conn2, ack[:])
+	conn2.Close()
+	if read_err == nil {
+		t.Fatal("frame 2: expected no response (rate limited), but read succeeded")
+	}
+}
+
 // TestIntegrationInventoryReconciler verifies that nodes in the inventory CSV but
 // absent from the registry are flagged UNINSTRUMENTED_SERVER after reconciliation.
 func TestIntegrationInventoryReconciler(t *testing.T) {

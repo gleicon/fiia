@@ -67,7 +67,7 @@ func (r *Registry) Update(node_id string, timestamp_unix int64, m wire.USEMetric
 	state.Status = "OK"
 	state.Metrics = m
 	r.mu.Unlock()
-	// DB persistence (UpdateHeartbeat) is handled by ingest's async write queue.
+	// DB write intentionally absent — caller is responsible for persisting via UpdateHeartbeat.
 }
 
 // GetAll returns a snapshot of all node states.

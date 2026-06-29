@@ -1,39 +1,48 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 //go:embed postgres_migrations/*.sql
 var postgres_migrations_fs embed.FS
 
-// PostgresStore implements Store using a Postgres database.
+// PostgresStore implements Store using a Postgres connection pool (pgxpool).
 type PostgresStore struct {
-	db *sql.DB
+	pool *pgxpool.Pool
 }
 
-// NewPostgresStore opens a connection using dsn and runs migrations.
+// NewPostgresStore creates a connection pool for dsn and runs migrations.
+// Migrations are run via a transient database/sql wrapper; the pool handles
+// all subsequent queries directly.
 func NewPostgresStore(dsn string) (*PostgresStore, error) {
 	assert(dsn != "", "dsn must not be empty")
 
-	db, err := sql.Open("pgx", dsn)
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open postgres: %w", err)
+		return nil, fmt.Errorf("create postgres pool: %w", err)
 	}
 
-	if err := runPostgresMigrations(db); err != nil {
-		db.Close()
+	// Use a database/sql wrapper over the pool solely for goose migrations.
+	mig_db := stdlib.OpenDBFromPool(pool)
+	if err := runPostgresMigrations(mig_db); err != nil {
+		mig_db.Close()
+		pool.Close()
 		return nil, fmt.Errorf("run postgres migrations: %w", err)
 	}
+	mig_db.Close()
 
-	return &PostgresStore{db: db}, nil
+	return &PostgresStore{pool: pool}, nil
 }
 
 func runPostgresMigrations(db *sql.DB) error {
@@ -49,11 +58,11 @@ func runPostgresMigrations(db *sql.DB) error {
 }
 
 func (s *PostgresStore) UpdateHeartbeat(node_id string, timestamp_unix int64) error {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 	assert(node_id != "", "node_id must not be empty")
 	assert(timestamp_unix > 0, "timestamp_unix must be positive")
 
-	_, err := s.db.Exec(
+	_, err := s.pool.Exec(context.Background(),
 		`INSERT INTO nodes (node_id, last_seen_unix, status)
 		 VALUES ($1, $2, 'OK')
 		 ON CONFLICT(node_id) DO UPDATE SET
@@ -68,15 +77,15 @@ func (s *PostgresStore) UpdateHeartbeat(node_id string, timestamp_unix int64) er
 }
 
 func (s *PostgresStore) GetNodeSecret(node_id string) ([]byte, error) {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 	assert(node_id != "", "node_id must not be empty")
 
 	var secret_bytes []byte
-	err := s.db.QueryRow(
+	err := s.pool.QueryRow(context.Background(),
 		`SELECT secret_bytes FROM node_secrets WHERE node_id = $1`,
 		node_id,
 	).Scan(&secret_bytes)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("unknown node %q", node_id)
 	}
 	if err != nil {
@@ -87,12 +96,12 @@ func (s *PostgresStore) GetNodeSecret(node_id string) ([]byte, error) {
 }
 
 func (s *PostgresStore) SetNodeSecret(node_id string, secret_bytes []byte) error {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 	assert(node_id != "", "node_id must not be empty")
 	assert(len(secret_bytes) > 0, "secret_bytes must not be empty")
 
 	created_unix := time.Now().Unix()
-	_, err := s.db.Exec(
+	_, err := s.pool.Exec(context.Background(),
 		`INSERT INTO node_secrets (node_id, secret_bytes, created_unix)
 		 VALUES ($1, $2, $3)
 		 ON CONFLICT(node_id) DO UPDATE SET
@@ -107,12 +116,12 @@ func (s *PostgresStore) SetNodeSecret(node_id string, secret_bytes []byte) error
 }
 
 func (s *PostgresStore) SetAlert(node_id, alert_type string, created_unix int64) error {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 	assert(node_id != "", "node_id must not be empty")
 	assert(alert_type != "", "alert_type must not be empty")
 	assert(created_unix > 0, "created_unix must be positive")
 
-	_, err := s.db.Exec(
+	_, err := s.pool.Exec(context.Background(),
 		`INSERT INTO alerts (node_id, alert_type, created_unix)
 		 VALUES ($1, $2, $3)
 		 ON CONFLICT(node_id, alert_type) DO NOTHING`,
@@ -125,11 +134,11 @@ func (s *PostgresStore) SetAlert(node_id, alert_type string, created_unix int64)
 }
 
 func (s *PostgresStore) ClearAlert(node_id, alert_type string) error {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 	assert(node_id != "", "node_id must not be empty")
 	assert(alert_type != "", "alert_type must not be empty")
 
-	_, err := s.db.Exec(
+	_, err := s.pool.Exec(context.Background(),
 		`DELETE FROM alerts WHERE node_id = $1 AND alert_type = $2`,
 		node_id, alert_type,
 	)
@@ -140,9 +149,9 @@ func (s *PostgresStore) ClearAlert(node_id, alert_type string) error {
 }
 
 func (s *PostgresStore) GetAlerts() ([]Alert, error) {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 
-	rows, err := s.db.Query(
+	rows, err := s.pool.Query(context.Background(),
 		`SELECT node_id, alert_type, created_unix FROM alerts ORDER BY node_id`,
 	)
 	if err != nil {
@@ -165,9 +174,9 @@ func (s *PostgresStore) GetAlerts() ([]Alert, error) {
 }
 
 func (s *PostgresStore) GetNodes() ([]Node, error) {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 
-	rows, err := s.db.Query(
+	rows, err := s.pool.Query(context.Background(),
 		`SELECT node_id, last_seen_unix, status FROM nodes ORDER BY node_id`,
 	)
 	if err != nil {
@@ -190,15 +199,15 @@ func (s *PostgresStore) GetNodes() ([]Node, error) {
 }
 
 func (s *PostgresStore) GetNode(node_id string) (Node, error) {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 	assert(node_id != "", "node_id must not be empty")
 
 	var n Node
-	err := s.db.QueryRow(
+	err := s.pool.QueryRow(context.Background(),
 		`SELECT node_id, last_seen_unix, status FROM nodes WHERE node_id = $1`,
 		node_id,
 	).Scan(&n.ID, &n.LastSeenUnix, &n.Status)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return Node{}, fmt.Errorf("node %q not found", node_id)
 	}
 	if err != nil {
@@ -209,12 +218,12 @@ func (s *PostgresStore) GetNode(node_id string) (Node, error) {
 }
 
 func (s *PostgresStore) AppendDrift(node_id string, timestamp_unix int64, status string, tasks_changed []string) error {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 	assert(node_id != "", "node_id must not be empty")
 	assert(status != "", "status must not be empty")
 
 	joined := strings.Join(tasks_changed, "\n")
-	_, err := s.db.Exec(
+	_, err := s.pool.Exec(context.Background(),
 		`INSERT INTO drift_events (node_id, timestamp_unix, status, tasks_changed)
 		 VALUES ($1, $2, $3, $4)`,
 		node_id, timestamp_unix, status, joined,
@@ -226,11 +235,11 @@ func (s *PostgresStore) AppendDrift(node_id string, timestamp_unix int64, status
 }
 
 func (s *PostgresStore) GetDriftEvents(node_id string, limit int) ([]DriftEvent, error) {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 	assert(node_id != "", "node_id must not be empty")
 	assert(limit > 0, "limit must be positive")
 
-	rows, err := s.db.Query(
+	rows, err := s.pool.Query(context.Background(),
 		`SELECT node_id, timestamp_unix, status, tasks_changed
 		 FROM drift_events WHERE node_id = $1
 		 ORDER BY timestamp_unix DESC LIMIT $2`,
@@ -260,11 +269,11 @@ func (s *PostgresStore) GetDriftEvents(node_id string, limit int) ([]DriftEvent,
 }
 
 func (s *PostgresStore) CountNodesWithStatus(status string) (int64, error) {
-	assert(s.db != nil, "db must not be nil")
+	assert(s.pool != nil, "pool must not be nil")
 	assert(status != "", "status must not be empty")
 
 	var count int64
-	err := s.db.QueryRow(
+	err := s.pool.QueryRow(context.Background(),
 		`SELECT COUNT(*) FROM nodes WHERE status = $1`, status,
 	).Scan(&count)
 	if err != nil {
@@ -274,6 +283,7 @@ func (s *PostgresStore) CountNodesWithStatus(status string) (int64, error) {
 }
 
 func (s *PostgresStore) Close() error {
-	assert(s.db != nil, "db must not be nil")
-	return s.db.Close()
+	assert(s.pool != nil, "pool must not be nil")
+	s.pool.Close()
+	return nil
 }

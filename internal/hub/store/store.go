@@ -5,12 +5,8 @@ import "fmt"
 // Open selects a Store implementation by driver.
 // For "sqlite", conn is a file path. For "postgres", conn is a connection DSN.
 func Open(driver, conn string) (Store, error) {
-	if driver == "" {
-		return nil, fmt.Errorf("driver must not be empty")
-	}
-	if conn == "" {
-		return nil, fmt.Errorf("conn must not be empty")
-	}
+	assert(driver != "", "driver must not be empty")
+	assert(conn != "", "conn must not be empty")
 
 	switch driver {
 	case "sqlite":
@@ -64,7 +60,9 @@ type Store interface {
 	// GetDriftEvents returns the most recent drift events for a node (latest first).
 	GetDriftEvents(node_id string, limit int) ([]DriftEvent, error)
 
-	// SetAlert creates or updates an alert flag on a node.
+	// SetAlert records an alert on a node if one does not already exist.
+	// created_unix is only stored on first creation; subsequent calls for the
+	// same (node_id, alert_type) pair are no-ops (first-seen semantics).
 	SetAlert(node_id, alert_type string, created_unix int64) error
 
 	// ClearAlert removes an alert flag from a node.

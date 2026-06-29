@@ -13,8 +13,8 @@ const (
 	SchemaVersionCurrent uint8 = 1
 	PayloadTypeHeartbeat uint8 = 0
 	PayloadTypeDrift     uint8 = 1
-	// PayloadTypeAck and PayloadTypeCommand are reserved for the hub→agent
-	// command channel (Increment 6). Not yet implemented — hub sends no frames today.
+	// PayloadTypeAck and PayloadTypeCommand are hub→agent direction only.
+	// Delivered as the response frame to a heartbeat connection.
 	PayloadTypeAck     uint8 = 2
 	PayloadTypeCommand uint8 = 3
 	HMACSize                 = 32

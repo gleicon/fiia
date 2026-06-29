@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -65,12 +66,13 @@ type Listener struct {
 	tls_cfg       *tls.Config
 	reg           *registry.Registry
 	store         store.Store
-	drift_counter *atomic.Int64  // may be nil
-	cmdq          *command.Queue // may be nil
+	drift_counter *atomic.Int64
+	cmdq          *command.Queue
 	rate_rps      float64
 	rate_burst    int
 	limiters      sync.Map // node_id → *rate.Limiter
 	write_ch      chan dbWriteOp
+	dummy_secret  [32]byte // random; replaces real secret for unknown nodes to prevent timing oracle
 }
 
 func assert(condition bool, message string) {
@@ -81,12 +83,19 @@ func assert(condition bool, message string) {
 
 // New creates a Listener. drift_counter and cmdq may be nil.
 // rate_rps and rate_burst configure per-node token-bucket rate limiting.
+// The async write goroutine is started by ServeListener and flushed on return;
+// callers must not share a Listener across multiple ServeListener calls.
 func New(tls_cfg *tls.Config, reg *registry.Registry, s store.Store, drift_counter *atomic.Int64, cmdq *command.Queue, rate_rps float64, rate_burst int) *Listener {
 	assert(tls_cfg != nil, "tls_cfg must not be nil")
 	assert(reg != nil, "registry must not be nil")
 	assert(s != nil, "store must not be nil")
 	assert(rate_rps > 0, "rate_rps must be positive")
 	assert(rate_burst > 0, "rate_burst must be positive")
+
+	var dummy [32]byte
+	if _, err := rand.Read(dummy[:]); err != nil {
+		panic("hub/ingest: generate dummy secret: " + err.Error())
+	}
 
 	return &Listener{
 		tls_cfg:       tls_cfg,
@@ -97,6 +106,7 @@ func New(tls_cfg *tls.Config, reg *registry.Registry, s store.Store, drift_count
 		rate_rps:      rate_rps,
 		rate_burst:    rate_burst,
 		write_ch:      make(chan dbWriteOp, write_ch_cap),
+		dummy_secret:  dummy,
 	}
 }
 
@@ -334,17 +344,22 @@ func (l *Listener) processFrame(body_bytes []byte, remote_addr string) (string, 
 		return "", false
 	}
 
-	secret_bytes, err := l.store.GetNodeSecret(node_id)
-	if err != nil {
-		log.Printf("ingest: unknown node %q from %s: %v", node_id, remote_addr, err)
-		return "", false
+	secret_bytes, secret_err := l.store.GetNodeSecret(node_id)
+	known := secret_err == nil
+	if !known {
+		// Use dummy secret so Verify always runs, preventing timing oracle on node existence.
+		secret_bytes = l.dummy_secret[:]
 	}
 
 	if !wire.Verify(secret_bytes, payload_bytes, sig_bytes) {
-		log.Printf("SECURITY: ingest: HMAC mismatch for node %q from %s — dropping payload", node_id, remote_addr)
-		// Security alert is written synchronously — never batched.
-		if err := l.store.SetAlert(node_id, "HMAC_MISMATCH", time.Now().Unix()); err != nil {
-			log.Printf("ingest: set HMAC_MISMATCH alert for %q: %v", node_id, err)
+		if known {
+			log.Printf("SECURITY: ingest: HMAC mismatch for node %q from %s — dropping payload", node_id, remote_addr)
+			// Security alert is written synchronously — never batched.
+			if err := l.store.SetAlert(node_id, "HMAC_MISMATCH", time.Now().Unix()); err != nil {
+				log.Printf("ingest: set HMAC_MISMATCH alert for %q: %v", node_id, err)
+			}
+		} else {
+			log.Printf("ingest: unknown node %q from %s", node_id, remote_addr)
 		}
 		return "", false
 	}
@@ -420,10 +435,9 @@ func (l *Listener) routeHeartbeat(payload_bytes []byte, node_id string) {
 	}
 	assert(p.NodeID == node_id, "decoded node_id must match peeked node_id")
 
-	// In-memory update is synchronous so metrics and liveness are immediately visible.
+	// In-memory update is synchronous: metrics and liveness visible immediately.
+	// DB write is async: batched by runWriter to keep this goroutine off the DB hot path.
 	l.reg.Update(p.NodeID, p.TimestampUnix, p.Metrics)
-
-	// DB persistence is async — high frequency, idempotent, deduplicable.
 	l.enqueueWrite(dbWriteOp{kind: opUpdateHeartbeat, node_id: p.NodeID, timestamp: p.TimestampUnix})
 	for _, alert_type := range []string{"AGENT_UNREACHABLE", "AGENT_PAUSED"} {
 		l.enqueueWrite(dbWriteOp{kind: opClearAlert, node_id: p.NodeID, alert_type: alert_type})

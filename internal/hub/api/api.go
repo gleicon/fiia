@@ -10,10 +10,27 @@ import (
 	"github.com/gleicon/fiia/internal/hub/store"
 )
 
+const (
+	node_id_max_len = 256
+	config_body_max = 4096
+)
+
 func assert(condition bool, message string) {
 	if !condition {
 		panic("hub/api: assertion failed: " + message)
 	}
+}
+
+func validNodeID(w http.ResponseWriter, node_id string) bool {
+	if node_id == "" {
+		http.Error(w, "node id required", http.StatusBadRequest)
+		return false
+	}
+	if len(node_id) > node_id_max_len {
+		http.Error(w, "node id too long", http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 // Server exposes the hub REST API.
@@ -66,8 +83,7 @@ func (srv *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 
 func (srv *Server) getNodeStatus(w http.ResponseWriter, r *http.Request) {
 	node_id := r.PathValue("id")
-	if node_id == "" {
-		http.Error(w, "node id required", http.StatusBadRequest)
+	if !validNodeID(w, node_id) {
 		return
 	}
 	node, err := srv.store.GetNode(node_id)
@@ -90,8 +106,7 @@ func (srv *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 
 func (srv *Server) getNodeDrift(w http.ResponseWriter, r *http.Request) {
 	node_id := r.PathValue("id")
-	if node_id == "" {
-		http.Error(w, "node id required", http.StatusBadRequest)
+	if !validNodeID(w, node_id) {
 		return
 	}
 	events, err := srv.store.GetDriftEvents(node_id, 50)
@@ -107,8 +122,7 @@ func (srv *Server) getNodeDrift(w http.ResponseWriter, r *http.Request) {
 // The command is delivered on the node's next heartbeat connection.
 func (srv *Server) postAuditNow(w http.ResponseWriter, r *http.Request) {
 	node_id := r.PathValue("id")
-	if node_id == "" {
-		http.Error(w, "node id required", http.StatusBadRequest)
+	if !validNodeID(w, node_id) {
 		return
 	}
 	if srv.cmdq == nil {
@@ -124,14 +138,14 @@ func (srv *Server) postAuditNow(w http.ResponseWriter, r *http.Request) {
 // Body: JSON {"playbook_path": "...", "interval_sec": N}
 func (srv *Server) postConfig(w http.ResponseWriter, r *http.Request) {
 	node_id := r.PathValue("id")
-	if node_id == "" {
-		http.Error(w, "node id required", http.StatusBadRequest)
+	if !validNodeID(w, node_id) {
 		return
 	}
 	if srv.cmdq == nil {
 		http.Error(w, "command queue not available", http.StatusServiceUnavailable)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, config_body_max)
 	var req struct {
 		PlaybookPath string `json:"playbook_path"`
 		IntervalSec  int    `json:"interval_sec"`

@@ -124,10 +124,11 @@ func (t *Transport) SendAuditResult(p wire.DriftPayload) {
 	frame := wire.BuildFrame(t.cfg.HMACSecret, payload_bytes)
 
 	if t.q != nil {
-		if queue_err := t.q.Write(frame); queue_err == nil {
+		queue_err := t.q.Write(frame)
+		if queue_err == nil {
 			return // queued; heartbeat drain will deliver it
 		}
-		log.Printf("transport: queue audit: %v", err)
+		log.Printf("transport: queue audit: %v", queue_err)
 	}
 
 	if err := t.sendFrame(frame); err != nil {
@@ -239,7 +240,6 @@ func (t *Transport) sendFrameExpectAck(frame []byte) (bool, *wire.CommandPayload
 	}
 
 	acked, cmd := readResponse(conn)
-	assert(conn != nil, "conn must not be nil after response read")
 	return acked, cmd, nil
 }
 
