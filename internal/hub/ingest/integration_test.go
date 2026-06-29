@@ -29,6 +29,23 @@ import (
 	"github.com/gleicon/fiia/internal/wire"
 )
 
+// serveAndCleanup starts l.ServeListener(ln) in a goroutine and registers a
+// t.Cleanup that closes ln and waits for ServeListener (and its writer goroutine)
+// to fully exit. Register store cleanup BEFORE calling this so LIFO ordering
+// ensures the listener stops before the store closes.
+func serveAndCleanup(t *testing.T, l *ingest.Listener, ln net.Listener) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		l.ServeListener(ln) //nolint:errcheck
+		close(done)
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		<-done
+	})
+}
+
 // genTestTLS returns a server TLS config and a CA pool for the client.
 // Uses a self-signed ECDSA cert valid for 127.0.0.1.
 func genTestTLS(t *testing.T) (server_cfg *tls.Config, ca_pool *x509.CertPool) {
@@ -109,7 +126,7 @@ func TestIntegrationHeartbeat(t *testing.T) {
 		t.Fatalf("tls listen: %v", err)
 	}
 	ingest_l := ingest.New(server_tls, reg, s, nil, nil, 100.0, 10)
-	go ingest_l.ServeListener(ingest_ln) //nolint:errcheck
+	serveAndCleanup(t, ingest_l, ingest_ln)
 	ingest_addr := ingest_ln.Addr().String()
 
 	// Start metrics server on a random port with an isolated Prometheus registry.
@@ -119,6 +136,7 @@ func TestIntegrationHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("metrics listen: %v", err)
 	}
+	t.Cleanup(func() { metrics_ln.Close() })
 	go metrics_srv.ServeListener(metrics_ln) //nolint:errcheck
 	metrics_url := "http://" + metrics_ln.Addr().String() + "/metrics"
 
@@ -201,7 +219,7 @@ func TestIntegrationDriftPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls listen: %v", err)
 	}
-	go ingest_l.ServeListener(ingest_ln) //nolint:errcheck
+	serveAndCleanup(t, ingest_l, ingest_ln)
 
 	// Build and send a drift payload.
 	drift_p := wire.DriftPayload{
@@ -281,7 +299,7 @@ func TestIntegrationRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls listen: %v", err)
 	}
-	go ingest_l.ServeListener(ingest_ln) //nolint:errcheck
+	serveAndCleanup(t, ingest_l, ingest_ln)
 
 	payload, err := wire.EncodeHeartbeat(wire.HeartbeatPayload{
 		NodeID:        node_id,
@@ -357,7 +375,7 @@ func TestIntegrationHMACMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls listen: %v", err)
 	}
-	go ingest_l.ServeListener(ingest_ln) //nolint:errcheck
+	serveAndCleanup(t, ingest_l, ingest_ln)
 
 	payload, err := wire.EncodeHeartbeat(wire.HeartbeatPayload{
 		NodeID:        node_id,
@@ -420,7 +438,7 @@ func TestIntegrationUnknownNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls listen: %v", err)
 	}
-	go ingest_l.ServeListener(ingest_ln) //nolint:errcheck
+	serveAndCleanup(t, ingest_l, ingest_ln)
 
 	// node_id not registered in store; any secret will fail Verify.
 	payload, err := wire.EncodeHeartbeat(wire.HeartbeatPayload{

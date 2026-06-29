@@ -219,12 +219,20 @@ func (l *Listener) Serve(addr string) error {
 }
 
 // ServeListener accepts connections from ln and handles each in a new goroutine.
-// Starts the async write goroutine; flushes remaining writes before returning.
+// Starts the async write goroutine; blocks until it has fully flushed before returning.
 func (l *Listener) ServeListener(ln net.Listener) error {
 	assert(ln != nil, "ln must not be nil")
 
 	done_ch := make(chan struct{})
-	go l.runWriter(done_ch)
+	var writer_done sync.WaitGroup
+	writer_done.Add(1)
+	go func() {
+		defer writer_done.Done()
+		l.runWriter(done_ch)
+	}()
+	// Defer order (LIFO): ln.Close → close(done_ch) → writer_done.Wait.
+	// Writer is guaranteed to have flushed before ServeListener returns.
+	defer writer_done.Wait()
 	defer func() { close(done_ch) }()
 	defer ln.Close()
 
