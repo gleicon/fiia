@@ -1,0 +1,34 @@
+---
+fiia_install_dir: /usr/local/bin
+fiia_config_dir: /etc/fiia
+fiia_log_dir: /var/log/fiia
+fiia_user: fiia
+
+fiia_heartbeat_interval_sec: 300
+fiia_audit_interval_sec: 1200
+fiia_audit_jitter_max_sec: 120
+fiia_audit_timeout_sec: 600
+
+# manifest_path: set this to use manifest-based drift check (recommended).
+# When set, ansible_playbook_path is ignored.
+fiia_manifest_path: "{{ fiia_config_dir }}/manifest.json"
+
+# ansible_playbook_path: set this to use ansible --check drift (legacy).
+# Only used when fiia_manifest_path is empty.
+fiia_ansible_playbook_path: ""
+
+# fiia_agent_binary: local path to the fiia-agent binary to deploy.
+# Required — no default.
+# fiia_agent_binary: /path/to/fiia-agent
+
+# fiia_hmac_secret_hex: 32-byte hex HMAC secret. Required, per-node unique.
+# fiia_hmac_secret_hex: ""
+
+# fiia_ca_cert: PEM content of the root CA certificate. Required.
+# fiia_ca_cert: ""
+
+# fiia_hub_addr: hub TLS ingest address. Required.
+# fiia_hub_addr: hub.example.com:9443
+
+# fiia_hub_api_addr: hub REST API address for post-deploy handshake. Required.
+# fiia_hub_api_addr: hub.example.com:9091

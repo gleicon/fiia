@@ -1,0 +1,83 @@
+---
+- name: Create fiia system user (no login shell, no sudo)
+  ansible.builtin.user:
+    name: "{{ fiia_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+    state: present
+
+- name: Create config, log, and state directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ fiia_config_dir }}", owner: root, mode: "0755" }
+    - { path: "{{ fiia_log_dir }}", owner: "{{ fiia_user }}", mode: "0750" }
+    - { path: /var/lib/fiia, owner: "{{ fiia_user }}", mode: "0700" }
+    - { path: /var/lib/fiia/queue, owner: "{{ fiia_user }}", mode: "0700" }
+    - { path: /var/lib/fiia/.ansible/tmp, owner: "{{ fiia_user }}", mode: "0700" }
+
+- name: Deploy root CA certificate
+  ansible.builtin.copy:
+    content: "{{ fiia_ca_cert }}"
+    dest: "{{ fiia_config_dir }}/root_ca.pem"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Write agent configuration (contains HMAC secret — mode 0400)
+  ansible.builtin.template:
+    src: agent.toml.j2
+    dest: "{{ fiia_config_dir }}/agent.toml"
+    owner: "{{ fiia_user }}"
+    group: root
+    mode: "0400"
+  notify: Restart fiia-agent
+
+- name: Install fiia-agent binary
+  ansible.builtin.copy:
+    src: "{{ fiia_agent_binary }}"
+    dest: "{{ fiia_install_dir }}/fiia-agent"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart fiia-agent
+
+- name: Install systemd unit
+  ansible.builtin.template:
+    src: fiia-agent.service.j2
+    dest: /etc/systemd/system/fiia-agent.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart fiia-agent
+
+- name: Install logrotate config
+  ansible.builtin.copy:
+    src: fiia-logrotate
+    dest: /etc/logrotate.d/fiia
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable and start fiia-agent
+  ansible.builtin.systemd:
+    name: fiia-agent
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait for node to appear in hub registry (post-deploy handshake)
+  ansible.builtin.uri:
+    url: "http://{{ fiia_hub_api_addr }}/nodes/{{ inventory_hostname }}/status"
+    status_code: 200
+  register: handshake_result
+  retries: 6
+  delay: 30
+  until: handshake_result.status == 200

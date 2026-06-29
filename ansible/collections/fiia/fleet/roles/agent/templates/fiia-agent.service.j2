@@ -1,0 +1,36 @@
+[Unit]
+Description=Fiia agent - fleet telemetry and drift detection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User={{ fiia_user }}
+ExecStart={{ fiia_install_dir }}/fiia-agent -config {{ fiia_config_dir }}/agent.toml
+Restart=on-failure
+RestartSec=30
+
+Environment=HOME=/var/lib/fiia
+Environment=ANSIBLE_CONFIG=/var/lib/fiia/ansible.cfg
+
+CPUQuota=10%
+MemoryMax=256M
+IOReadBandwidthMax=/ 512K
+IOWriteBandwidthMax=/ 512K
+Nice=19
+IOSchedulingClass=idle
+
+WatchdogSec=120
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ fiia_log_dir }} /var/lib/fiia
+PrivateTmp=true
+CapabilityBoundingSet=
+
+StandardOutput=append:{{ fiia_log_dir }}/agent.log
+StandardError=append:{{ fiia_log_dir }}/agent.log
+
+[Install]
+WantedBy=multi-user.target

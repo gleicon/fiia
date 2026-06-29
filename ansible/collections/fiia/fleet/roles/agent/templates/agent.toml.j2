@@ -1,0 +1,17 @@
+[agent]
+node_id               = "{{ inventory_hostname }}"
+hub_addr              = "{{ fiia_hub_addr }}"
+hmac_secret_hex       = "{{ fiia_hmac_secret_hex }}"
+ca_cert_path          = "{{ fiia_config_dir }}/root_ca.pem"
+heartbeat_interval_sec = {{ fiia_heartbeat_interval_sec }}
+audit_interval_sec    = {{ fiia_audit_interval_sec }}
+audit_jitter_max_sec  = {{ fiia_audit_jitter_max_sec }}
+audit_timeout_sec     = {{ fiia_audit_timeout_sec }}
+drift_log_path        = "{{ fiia_log_dir }}/drift.log"
+queue_dir             = "/var/lib/fiia/queue"
+
+{% if fiia_manifest_path %}
+manifest_path = "{{ fiia_manifest_path }}"
+{% elif fiia_ansible_playbook_path %}
+ansible_playbook_path = "{{ fiia_ansible_playbook_path }}"
+{% endif %}
