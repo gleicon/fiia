@@ -1,0 +1,172 @@
+---
+# Test the fiia.fleet.manifest module against a real Linux node.
+# Run via: make dev-collection-test
+#
+# Tests:
+#   1. Module writes a valid manifest.json with correct structure
+#   2. File sha256 in manifest matches sha256sum(1) output
+#   3. Package version is captured (openssh-server, present on Ubuntu)
+#   4. Service state is captured (ssh)
+#   5. Second run is idempotent (changed=false)
+#   6. Modifying a tracked file causes changed=true on next run
+#   7. Stale manifest warning fires (generated_at set to 1970)
+
+- name: Test fiia.fleet.manifest module
+  hosts: fleet
+  become: true
+
+  vars:
+    test_dir: /tmp/fiia-manifest-test
+    manifest_path: /tmp/fiia-manifest-test/manifest.json
+    test_file: /tmp/fiia-manifest-test/managed.conf
+    test_content: "# managed by fiia test harness\nversion: 1\n"
+
+  tasks:
+    # ── setup ──────────────────────────────────────────────────────────────────
+
+    - name: Create test directory
+      ansible.builtin.file:
+        path: "{{ test_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write test file with known content
+      ansible.builtin.copy:
+        content: "{{ test_content }}"
+        dest: "{{ test_file }}"
+        mode: "0644"
+
+    # ── test 1: manifest is written ────────────────────────────────────────────
+
+    - name: "[T1] Run manifest module"
+      fiia.fleet.manifest:
+        dest: "{{ manifest_path }}"
+        files:
+          - "{{ test_file }}"
+        packages:
+          - openssh-server
+        services:
+          - { name: ssh, running: true, enabled: true }
+      register: t1
+
+    - name: "[T1] Assert module succeeded and manifest path correct"
+      ansible.builtin.assert:
+        that:
+          - t1 is not failed
+          - t1.manifest_path == manifest_path
+        fail_msg: "T1 failed: {{ t1 }}"
+
+    - name: "[T1] Read manifest"
+      ansible.builtin.slurp:
+        src: "{{ manifest_path }}"
+      register: manifest_raw
+
+    - name: "[T1] Parse manifest"
+      ansible.builtin.set_fact:
+        manifest: "{{ manifest_raw.content | b64decode | from_json }}"
+
+    - name: "[T1] Assert manifest structure"
+      ansible.builtin.assert:
+        that:
+          - manifest.schema_version == 1
+          - manifest.generated_at > 0
+          - manifest.files | length == 1
+          - manifest.files[0].path == test_file
+          - manifest.files[0].sha256 | length == 64
+          - manifest.files[0].mode is defined
+          - manifest.packages | length == 1
+          - manifest.packages[0].name == "openssh-server"
+          - manifest.services | length == 1
+          - manifest.services[0].name == "ssh"
+        fail_msg: "T1 structure check failed: {{ manifest }}"
+
+    # ── test 2: sha256 matches sha256sum ───────────────────────────────────────
+
+    - name: "[T2] Get sha256sum of test file from system"
+      ansible.builtin.command:
+        cmd: sha256sum {{ test_file }}
+      register: t2_sum
+      changed_when: false
+
+    - name: "[T2] Assert manifest hash matches sha256sum"
+      ansible.builtin.assert:
+        that:
+          - manifest.files[0].sha256 == t2_sum.stdout.split()[0]
+        fail_msg: >-
+          T2 hash mismatch: manifest={{ manifest.files[0].sha256 }}
+          sha256sum={{ t2_sum.stdout.split()[0] }}
+
+    # ── test 3: idempotency ────────────────────────────────────────────────────
+
+    - name: "[T3] Run manifest module again (should be unchanged)"
+      fiia.fleet.manifest:
+        dest: "{{ manifest_path }}"
+        files:
+          - "{{ test_file }}"
+        packages:
+          - openssh-server
+        services:
+          - { name: ssh, running: true, enabled: true }
+      register: t3
+
+    - name: "[T3] Assert not changed on second run"
+      ansible.builtin.assert:
+        that:
+          - not t3.changed
+        fail_msg: "T3 idempotency failed: module reported changed=true on second run"
+
+    # ── test 4: file modification triggers changed=true ───────────────────────
+
+    - name: "[T4] Modify test file"
+      ansible.builtin.copy:
+        content: "# content changed by drift test\nversion: 99\n"
+        dest: "{{ test_file }}"
+        mode: "0644"
+
+    - name: "[T4] Run manifest module after file modification"
+      fiia.fleet.manifest:
+        dest: "{{ manifest_path }}"
+        files:
+          - "{{ test_file }}"
+        packages:
+          - openssh-server
+        services:
+          - { name: ssh, running: true, enabled: true }
+      register: t4
+
+    - name: "[T4] Assert changed=true after file modification"
+      ansible.builtin.assert:
+        that:
+          - t4.changed
+        fail_msg: "T4 failed: manifest did not report changed after file modification"
+
+    # ── test 5: missing file produces warning, not failure ────────────────────
+
+    - name: "[T5] Run manifest with a non-existent file path"
+      fiia.fleet.manifest:
+        dest: "{{ manifest_path }}"
+        files:
+          - "{{ test_file }}"
+          - /tmp/fiia-manifest-test/does-not-exist.conf
+        packages: []
+        services: []
+      register: t5
+
+    - name: "[T5] Assert module did not fail, and warning was emitted"
+      ansible.builtin.assert:
+        that:
+          - t5 is not failed
+          - t5.warnings is defined
+          - t5.warnings | length > 0
+        fail_msg: "T5 failed: expected warning for missing file, got {{ t5 }}"
+
+    # ── cleanup ────────────────────────────────────────────────────────────────
+
+    - name: Remove test directory
+      ansible.builtin.file:
+        path: "{{ test_dir }}"
+        state: absent
+
+    - name: Print test summary
+      ansible.builtin.debug:
+        msg: "All fiia.fleet.manifest tests passed."

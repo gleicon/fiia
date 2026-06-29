@@ -11,6 +11,9 @@ fiia-hub-*
 dev/ca/
 dev/*.pem
 
+# Dev backend config (machine-specific, written by make dev-setup)
+dev/.backend
+
 # SQLite databases
 *.db
 *.sqlite

@@ -1,20 +1,21 @@
 ---
-# Fiia dev bootstrap — targets a local Colima/Lima VM.
+# Fiia dev bootstrap — targets a Lima VM, Colima VM, or localhost (Linux).
 # Run via: make dev-deploy
 #
 # Differences from bootstrap.yml (production):
-#   - No serial batching (single VM)
-#   - hub_addr points to host.lima.internal (macOS host from inside the VM)
+#   - No serial batching (single node)
+#   - hub_addr points to fiia_dev_hub_host (host.lima.internal for Lima/Colima, localhost for Linux)
 #   - HMAC secret and CA cert are read from the local dev/ directory
 #   - Handshake check uses ignore_errors (hub may not be running yet)
 #   - Node secret must be seeded in the hub before starting: make dev-hub
 #
 # Variables that can be overridden on the command line (-e):
-#   fiia_agent_binary   - path to cross-compiled linux binary (default: fiia-agent-linux-arm64)
-#   fiia_node_id        - node ID to register (default: colima-dev)
-#   fiia_hub_hmac_secret_hex - 32-byte hex HMAC secret (default: dev secret from dev/agent.toml)
+#   fiia_agent_binary   - path to cross-compiled linux binary
+#   fiia_node_id        - node ID to register
+#   fiia_hub_hmac_secret_hex - 32-byte hex HMAC secret
+#   fiia_dev_hub_host   - host reachable from target (default: host.lima.internal; use localhost on Linux)
 
-- name: Bootstrap fiia agent on dev VM
+- name: Bootstrap fiia agent on dev node
   hosts: fleet
   become: true
   vars:
@@ -27,10 +28,11 @@
     fiia_audit_jitter_max_sec: 10
     fiia_audit_timeout_sec: 300
     fiia_ansible_playbook_path: "{{ fiia_config_dir }}/baseline.yml"
-    fiia_hub_addr: "host.lima.internal:9443"
-    fiia_hub_api_addr: "host.lima.internal:9091"
+    fiia_dev_hub_host: "{{ 'localhost' if ansible_connection == 'local' else 'host.lima.internal' }}"
+    fiia_hub_addr: "{{ fiia_dev_hub_host }}:9443"
+    fiia_hub_api_addr: "{{ fiia_dev_hub_host }}:9091"
     fiia_hub_hmac_secret_hex: "0000000000000000000000000000000000000000000000000000000000000001"
-    fiia_node_id: "colima-dev"
+    fiia_node_id: "dev-node"
     fiia_agent_binary: "fiia-agent-linux-arm64"
     fiia_ca_cert: "{{ lookup('file', '../../dev/ca/root_ca.pem') }}"
 
