@@ -1,0 +1,32 @@
+groups:
+  - name: fiia
+    rules:
+      - alert: FiiaDriftDetected
+        # Alert on the always-fresh status gauge so the alert resolves as soon
+        # as the node is back in compliance. The exact deviations are exposed
+        # as the 'fiia_drift_details' metric (Drifted nodes dashboard panel).
+        expr: fiia_drift_status == 1
+        for: 15s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Configuration drift detected on {{ $labels.host_name }}"
+          description: "fiia_drift_status=1 on {{ $labels.host_name }}. See the 'Drifted nodes' panel / fiia_drift_details for the exact deviations; re-run the provisioning playbook (IaS) or use -remediate to fix."
+
+      - alert: FiiaCheckError
+        expr: fiia_drift_status == 2
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fiia cannot verify configuration on {{ $labels.host_name }}"
+          description: "fiia_drift_status=2 on {{ $labels.host_name }}. The agent cannot read or verify its manifest. A normal install needs no OS changes — grant the service user read access to the manifest (e.g. chown fiia:root /etc/fiia/manifest.json && chmod 0400) or run the agent as root."
+
+      - alert: FiiaNodeSilent
+        expr: absent(fiia_alive)
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No fiia.alive series — node silent"
+          description: "The agent heartbeat is missing for {{ $labels.instance }}; the node may be down or the agent stopped."

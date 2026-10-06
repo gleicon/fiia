@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  otelcol:
+    image: otel/opentelemetry-collector:0.162.0
+    command: ["--config=/etc/otelcol.yaml"]
+    volumes:
+      - ./otelcol.yaml:/etc/otelcol.yaml:ro
+      - ./out:/tmp/e2e-out
+    ports:
+      - "4318:4318"
+      - "9464:9464"
+
+  agent:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile.agent
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otelcol:4318
+    depends_on:
+      - otelcol

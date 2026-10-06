@@ -2,18 +2,14 @@
 # Fiia dev bootstrap — targets a Lima VM, Colima VM, or localhost (Linux).
 # Run via: make dev-deploy
 #
-# Differences from bootstrap.yml (production):
-#   - No serial batching (single node)
-#   - hub_addr points to fiia_dev_hub_host (host.lima.internal for Lima/Colima, localhost for Linux)
-#   - HMAC secret and CA cert are read from the local dev/ directory
-#   - Handshake check uses ignore_errors (hub may not be running yet)
-#   - Node secret must be seeded in the hub before starting: make dev-hub
+# Installs fiia-agent as a systemd service, writes a sentinel+motd baseline,
+# records it with the agent binary (-write-manifest), and verifies with -check.
+# No hub, no secrets, no certificates. Drift verdicts go to OTel (stdout
+# by default; set fiia_otlp_endpoint to ship to a collector).
 #
 # Variables that can be overridden on the command line (-e):
-#   fiia_agent_binary   - path to cross-compiled linux binary
-#   fiia_node_id        - node ID to register
-#   fiia_hub_hmac_secret_hex - 32-byte hex HMAC secret
-#   fiia_dev_hub_host   - host reachable from target (default: host.lima.internal; use localhost on Linux)
+#   fiia_agent_binary - path to cross-compiled linux binary
+#   fiia_node_id      - node ID for the report
 
 - name: Bootstrap fiia agent on dev node
   hosts: fleet
@@ -26,23 +22,11 @@
     fiia_heartbeat_interval_sec: 30
     fiia_audit_interval_sec: 120
     fiia_audit_jitter_max_sec: 10
-    fiia_audit_timeout_sec: 300
-    fiia_ansible_playbook_path: "{{ fiia_config_dir }}/baseline.yml"
-    fiia_dev_hub_host: "{{ 'localhost' if ansible_connection == 'local' else 'host.lima.internal' }}"
-    fiia_hub_addr: "{{ fiia_dev_hub_host }}:9443"
-    fiia_hub_api_addr: "{{ fiia_dev_hub_host }}:9091"
-    fiia_hub_hmac_secret_hex: "0000000000000000000000000000000000000000000000000000000000000001"
     fiia_node_id: "dev-node"
     fiia_agent_binary: "fiia-agent-linux-arm64"
-    fiia_ca_cert: "{{ lookup('file', '../../dev/ca/root_ca.pem') }}"
+    fiia_otlp_endpoint: ""
 
   tasks:
-    - name: Install ansible (Colima default is Ubuntu; use apt + update_cache for fresh VM)
-      ansible.builtin.apt:
-        name: ansible
-        state: present
-        update_cache: true
-
     - name: Create fiia system user (no login shell, no sudo)
       ansible.builtin.user:
         name: "{{ fiia_user }}"
@@ -51,7 +35,7 @@
         create_home: false
         state: present
 
-    - name: Create config, log, and state directories
+    - name: Create config and log directories
       ansible.builtin.file:
         path: "{{ item.path }}"
         state: directory
@@ -61,17 +45,8 @@
       loop:
         - { path: "{{ fiia_config_dir }}", owner: root, mode: "0755" }
         - { path: "{{ fiia_log_dir }}", owner: "{{ fiia_user }}", mode: "0750" }
-        - { path: "/var/lib/fiia", owner: "{{ fiia_user }}", mode: "0700" }
 
-    - name: Deploy root CA certificate
-      ansible.builtin.copy:
-        content: "{{ fiia_ca_cert }}"
-        dest: "{{ fiia_config_dir }}/root_ca.pem"
-        owner: root
-        group: root
-        mode: "0644"
-
-    - name: Write agent configuration (0400)
+    - name: Write agent configuration
       ansible.builtin.template:
         src: files/agent.toml.j2
         dest: "{{ fiia_config_dir }}/agent.toml"
@@ -79,28 +54,7 @@
         group: root
         mode: "0400"
       vars:
-        # Override inventory_hostname with explicit node_id for dev
         inventory_hostname: "{{ fiia_node_id }}"
-
-    - name: Write ansible.cfg (disables fact gathering; sets tmp paths for fiia service user)
-      ansible.builtin.copy:
-        dest: /var/lib/fiia/ansible.cfg
-        owner: "{{ fiia_user }}"
-        group: root
-        mode: "0640"
-        content: |
-          [defaults]
-          gathering = explicit
-          local_tmp = /var/lib/fiia/.ansible/tmp
-          remote_tmp = /var/lib/fiia/.ansible/tmp
-
-    - name: Deploy dev baseline playbook
-      ansible.builtin.copy:
-        src: "{{ playbook_dir }}/../../dev/baseline.yml"
-        dest: "{{ fiia_ansible_playbook_path }}"
-        owner: root
-        group: root
-        mode: "0644"
 
     - name: Install fiia-agent binary
       ansible.builtin.copy:
@@ -127,6 +81,41 @@
         group: root
         mode: "0644"
 
+    - name: Write dev baseline files
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - dest: /etc/fiia/sentinel
+          content: |
+            # managed by fiia baseline — do not edit
+            version: 1
+            state: ok
+        - dest: /etc/motd
+          content: "Authorized access only. Activity is monitored by Fiia.\n"
+
+    - name: Record dev baseline manifest (last provisioning step)
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - -write-manifest
+          - -manifest
+          - "{{ fiia_config_dir }}/manifest.json"
+          - -files
+          - /etc/fiia/sentinel,/etc/motd
+      register: fiia_record
+      changed_when: "'wrote ' in fiia_record.stdout"
+
+    - name: Make manifest readable by the fiia service account (still 0400)
+      ansible.builtin.file:
+        path: "{{ fiia_config_dir }}/manifest.json"
+        owner: "{{ fiia_user }}"
+        group: root
+        mode: "0400"
+
     - name: Enable and start fiia-agent
       ansible.builtin.systemd:
         name: fiia-agent
@@ -134,21 +123,16 @@
         state: restarted
         daemon_reload: true
 
-    - name: Wait for node to appear in hub registry (ignore if hub not running)
-      ansible.builtin.uri:
-        url: "http://{{ fiia_hub_api_addr }}/nodes/{{ fiia_node_id }}/status"
-        status_code: 200
-      register: handshake_result
-      retries: 6
-      delay: 10
-      until: handshake_result.status == 200
-      ignore_errors: true
-
-    - name: Show handshake result
-      ansible.builtin.debug:
-        msg: >-
-          {{ 'Node registered in hub.' if handshake_result.status == 200
-             else 'Hub not reachable — start hub with: make dev-hub' }}
+    - name: Verify baseline reads clean
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - -check
+          - -manifest
+          - "{{ fiia_config_dir }}/manifest.json"
+      register: fiia_check
+      changed_when: false
+      failed_when: fiia_check.rc != 0
 
   handlers:
     - name: Reload systemd

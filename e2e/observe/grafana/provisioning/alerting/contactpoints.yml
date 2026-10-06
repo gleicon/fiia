@@ -1,0 +1,13 @@
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: Fiia webhook
+    receivers:
+      - uid: fiia-webhook
+        type: webhook
+        settings:
+          # host.docker.internal resolves to the Docker/Colima host, so you can
+          # point this at any local webhook listener (e.g. the demo listener in
+          # e2e/observe/run-webhook.sh) or at Slack/Teams/email in production.
+          url: http://host.docker.internal:9999/fiia-alert
+          httpMethod: POST

@@ -1,165 +1,51 @@
 # Fiia — Architecture
 
-## Overview
-
-Fiia is structured as two independent binaries sharing a single wire contract package. The hub and agent never import each other's internals; `internal/wire` is the only shared package.
+One binary (`fiia-agent`) plus the `fiia.fleet` ansible collection. No
+server side: verdicts and liveness go to your OpenTelemetry pipeline,
+where all alerting happens. The agent binary is the single manifest
+generator; Ansible invokes `-write-manifest` as the last task.
 
 ```
-[edge node]                               [hub host]
-
-fiia-agent
-  ├─ heartbeat goroutine (5 min)          fiia-hub
-  │   ├─ collect USE metrics (/proc)        ├─ ingest (TLS :9443)
-  │   └─ send HeartbeatPayload ──────────→  │   ├─ HMAC verify (before decode)
-  │                                         │   ├─ registry.Update()
-  ├─ audit goroutine (20 min ± jitter)      │   └─ store.AppendDrift()
-  │   ├─ read manifest.json (files/pkgs/svcs)│
-  │   └─ send DriftPayload ──────────────→  ├─ registry (in-memory + SQLite flush)
-  │                                         │   └─ expiry goroutine (1 min tick)
-  └─ sd_notify watchdog (25s)               │
-                                            ├─ inventory reconciler (configurable tick)
-                                            ├─ REST API (HTTP :9091)
-                                            └─ Prometheus metrics (HTTP :9091/metrics)
+provision (ansible, plain SSH)              operate (OTel backend)
+──────────────────────────────              ─────────────────────
+fiia-agent -write-manifest (last task)
+  → /etc/fiia/manifest.json          fiia-agent (systemd unit)
+     │                                 ├─ heartbeat loop → fiia.alive
+     │                                 ├─ audit loop → fiia.drift.status
+     │                                 ├─   + fiia.drift.details (deviations)
+     │                                 ├─   + remediate (opt-in)
+     └─ promise ───────────────────→  └─ check log record (fiia.deviations)
+                                              │  ┌ stdout (default)
+                                              ├──┤
+                                              │  └ OTLP/HTTP (endpoint set)
+                                              ▼
+                                     collector → Grafana / Alertmanager
+                                       ├─ absent fiia.alive → node silent
+                                       └─ fiia.drift.status == 1 → drift
 ```
 
-## Component breakdown
-
-### Agent
+## Components
 
 | Package | Responsibility |
 |---------|----------------|
-| `cmd/agent` | Wires packages; handles SIGTERM; calls `audit.Probe` once at startup |
-| `internal/agent/config` | Loads and validates `agent.toml` |
-| `internal/agent/heartbeat` | 5-min heartbeat ticker; adaptive backoff (5→10→20→40s) on hub failure; fixed 25s watchdog ticker for sd_notify |
-| `internal/agent/telemetry` | Reads `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`, PSI pressure files; `sync.Pool` buffer reuse |
-| `internal/agent/audit` | Reads `manifest.json` (files→SHA256, packages→dpkg/rpm version, services→systemctl state); computes deviations natively in Go; falls back to `ansible-playbook --check` if `manifest_path` not configured; `Probe()` at startup |
-| `internal/agent/transport` | TLS 1.3 client; per-send connection; disk queue for store-and-forward |
-| `internal/agent/queue` | Disk-backed ring buffer (64 entries, `/var/lib/fiia/queue/`); write-before-send; advance on hub ACK |
-| `internal/agent/sdnotify` | Inline sd_notify (no CGO, no external dep); writes `READY=1` / `WATCHDOG=1` to `$NOTIFY_SOCKET` |
+| `cmd/agent` | Flags, OTel setup, SIGTERM, systemd notify |
+| `internal/agent/config` | `agent.toml` (only `manifest_path` required) |
+| `internal/agent/audit` | Manifest read / check / generate / scan / remediate; no subprocess |
+| `internal/agent/otel` | OTel providers; gauges, counter, per-check log records |
+| `internal/agent/sdnotify` | Inline sd_notify, no CGO |
+| `internal/assert` | Shared precondition helper |
+| `fiia.fleet` collection | `agent` role (provision-time) — invokes the agent binary |
 
-### Hub
+## Rules
 
-| Package | Responsibility |
-|---------|----------------|
-| `cmd/hub` | Wires packages; handles SIGTERM; starts ingest and API servers |
-| `internal/hub/config` | Loads and validates `hub.toml`; exposes `EnrollmentToken` and `WebhookURL` fields |
-| `internal/hub/ingest` | TLS 1.3 listener; per-connection goroutine; enforces HMAC validation before MessagePack decode; async write queue for heartbeat DB writes; fires async HTTP webhook on alert set/clear |
-| `internal/hub/registry` | In-memory node state map (`sync.RWMutex`); flushes to store on each heartbeat; expiry goroutine marks `AGENT_PAUSED` / `AGENT_UNREACHABLE` |
-| `internal/hub/store` | `Store` interface; SQLite implementation via `modernc.org/sqlite` (pure Go); goose migrations |
-| `internal/hub/inventory` | `InventoryReader` interface; CSV implementation; reconciler goroutine flags `UNINSTRUMENTED_SERVER` |
-| `internal/hub/metrics` | Prometheus custom collector for per-node USE gauges; registered with `prometheus.DefaultRegisterer` |
-| `internal/hub/api` | REST API: `GET /nodes`, `GET /nodes/{id}/status`, `GET /nodes/{id}/drift`, `GET /alerts`, `POST /nodes/{id}/enroll`; also serves `/metrics` and `/healthz` via `WithMetrics()` builder |
+- `cmd/agent` imports `internal/agent/*` only
+- `audit` never touches OTel; only `otel` imports the SDK
+- Manifest modes: `declared` (listed items) / `snapshot` (+ full pkg/svc lists)
+- Verdicts: `OK` (0) / `DRIFT_DETECTED` (1) / `MANIFEST_NOT_FOUND` or
+  `CHECK_ERROR` (2); stale manifest (>90d) warns without changing the verdict
+- No new external dependencies without written justification (decisions live
+  in git history)
 
-### Shared
+## Limits (systemd unit)
 
-| Package | Responsibility |
-|---------|----------------|
-| `internal/wire` | `HeartbeatPayload`, `DriftPayload` structs; `Sign`, `Verify`, `BuildFrame`, `BuildAckFrame`, `SplitFrame`, `PeekNodeID`, `PeekPayloadType`; imports nothing internal |
-
-## Data flows
-
-### Heartbeat path
-
-```
-agent:heartbeat
-  → wire.EncodeHeartbeat + wire.BuildFrame
-  → queue.Write (disk)
-  → transport.sendFrameExpectAck (TLS)
-  → hub:ingest.readFrame
-  → wire.SplitFrame → PeekNodeID → store.GetNodeSecret → wire.Verify
-  → wire.PeekPayloadType → routeHeartbeat
-  → registry.Update + store.ClearAlert (AGENT_UNREACHABLE, AGENT_PAUSED)
-  → ingest.sendAck (PayloadTypeAck frame)
-  → transport.readAck → queue.Advance
-```
-
-### Drift path
-
-```
-agent:audit.Run
-  [manifest mode]
-    read manifest.json → check files (SHA256+mode), packages (dpkg/rpm), services (systemctl)
-    if PackageSnapshot present → listInstalledPackages() → flag pkg:unauthorized:<name>
-    if ServiceSnapshot present → listActiveServices()  → flag svc:unauthorized:<name>
-    set ManifestGeneratedAt from manifest.generated_at
-  [ansible mode]  ansible-playbook --check --diff → parse exit code
-  → wire.EncodeDrift (includes ManifestGeneratedAt) + wire.BuildFrame
-  → queue.Write (disk)
-  → [delivered on next heartbeat drain, or immediately if hub reachable]
-  → hub:ingest.routeDrift
-  → store.AppendDrift
-  → store.SetAlert (DRIFT_DETECTED) or store.ClearAlert (OK)
-  → fireWebhook (async) if alert_webhook_url set
-  → if ManifestGeneratedAt > 0 and age > 90 days: store.SetAlert (MANIFEST_STALE)
-```
-
-The manifest is generated by the `fiia.fleet.manifest` ansible module as the last task in the provisioning play. Supports two modes:
-
-| Mode | Behaviour |
-|------|-----------|
-| `declared` (default) | Checks only listed files, packages, and services |
-| `snapshot` | Also records all installed packages and all active services; agent flags any additions as `pkg:unauthorized:<name>` or `svc:unauthorized:<name>` |
-
-At audit time the agent reads the manifest directly — no ansible subprocess is forked. Service checks skip silently on non-systemd init systems (`systemctl` not found).
-
-### Enrollment path
-
-```
-ansible role (bootstrap play)
-  → POST /nodes/{id}/enroll  Authorization: Bearer <enrollment_token>
-  ← {"node_id": "...", "secret": "<hex>"}  (hub generates 32-byte HMAC secret)
-  → write hmac_secret_hex to /etc/fiia/agent.toml
-```
-
-Enrollment is optional. If `enrollment_token` is not set in hub.toml the endpoint is not registered and secrets must be seeded via `--seed-node`. When set, the ansible role calls the endpoint once during bootstrap; the hub generates and stores the HMAC secret, returning it as hex for the role to write to `agent.toml`.
-
-### Expiry path
-
-```
-hub:registry expiry goroutine (1 min tick)
-  → for each node: if last_seen > paused_threshold → store.SetAlert(AGENT_PAUSED)
-                   if last_seen > unreachable_threshold → store.SetAlert(AGENT_UNREACHABLE)
-  → log fleet summary (total / alive / paused / unreachable / drift count)
-```
-
-### Inventory reconciliation path
-
-```
-hub:inventory reconciler (configurable tick, runs immediately on start)
-  → InventoryReader.ListNodes
-  → for each node not in registry: store.SetAlert(UNINSTRUMENTED_SERVER)
-```
-
-## Dependency rules
-
-- `cmd/agent` imports `internal/agent/*` and `internal/wire` — never `internal/hub/*`
-- `cmd/hub` imports `internal/hub/*` and `internal/wire` — never `internal/agent/*`
-- `internal/wire` imports nothing internal — it is the sole shared contract
-- `internal/hub/store` is a leaf — no imports from other hub packages
-- No new external dependencies without a written decision in `DECISIONS.md`
-
-## Storage
-
-The hub uses SQLite (pure Go, `modernc.org/sqlite`) via the `Store` interface. The interface is the Postgres migration seam: when the hub goes multi-node for HA, swap the implementation without touching any calling code.
-
-Tables: `nodes`, `node_secrets`, `drift_events`, `alerts`. Schema managed by `pressly/goose/v3` with embedded SQL migrations.
-
-## Upgrade paths
-
-| Current | Trigger | Upgrade path |
-|---------|---------|--------------|
-| SQLite | Hub goes multi-node | Implement `Store` interface for Postgres; no caller changes |
-| CSV inventory | NetBox deployed | Implement `InventoryReader` for NetBox REST; no caller changes |
-| HMAC per-node secrets | PKI/SPIFFE deployed | SPIFFE/SPIRE as long-term direction; no current timeline |
-
-## Resource constraints (systemd-enforced on edge nodes)
-
-| Resource | Limit |
-|----------|-------|
-| CPU | `CPUQuota=10%` |
-| Memory | `MemoryMax=256M` |
-| Disk I/O | `IOReadBandwidthMax=512K` / `IOWriteBandwidthMax=512K` |
-| Scheduling | `Nice=19`, `IOSchedulingClass=idle` |
-| Watchdog | `WatchdogSec=120` |
-
-The agent uses `sync.Pool` for `/proc` read buffers and `GOGC=off` to prevent GC thrashing; the hard ceiling is kernel-enforced by `MemoryMax`.
+CPU 10%, memory 256M, IO 512K, `Nice=19`, watchdog 120s.

@@ -1,0 +1,135 @@
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: Fiia
+    folder: Fiia
+    interval: 10s
+    rules:
+      - uid: fiia-drift-alert
+        title: Fiia drift detected
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: fiia_drift_status == 1
+              instant: true
+              range: false
+            relativeTimeRange:
+              from: 300
+              to: 0
+          - refId: B
+            datasourceUid: __expr__
+            type: reduce
+            model:
+              expression: A
+              reducer: last
+              type: reduce
+              refId: B
+          - refId: C
+            datasourceUid: __expr__
+            type: threshold
+            model:
+              expression: B
+              type: threshold
+              refId: C
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+        for: 15s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: Fiia drift detected on {{ $labels.host_name }}
+          description: "fiia_drift_status=1 on {{ $labels.host_name }}. See the Drifted nodes panel / fiia_drift_details for the exact deviations; re-run the provisioning playbook (IaS) or use -remediate to fix."
+
+      - uid: fiia-check-error-alert
+        title: Fiia check error
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: fiia_drift_status == 2
+              instant: true
+              range: false
+            relativeTimeRange:
+              from: 300
+              to: 0
+          - refId: B
+            datasourceUid: __expr__
+            type: reduce
+            model:
+              expression: A
+              reducer: last
+              type: reduce
+              refId: B
+          - refId: C
+            datasourceUid: __expr__
+            type: threshold
+            model:
+              expression: B
+              type: threshold
+              refId: C
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+        for: 15s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: Fiia cannot verify configuration on {{ $labels.host_name }}
+          description: fiia_drift_status=2 on {{ $labels.host_name }}. The agent cannot read or verify its manifest. A normal install needs no OS changes — grant the service user read access to the manifest (e.g. chown fiia:root /etc/fiia/manifest.json && chmod 0400) or run the agent as root.
+
+      - uid: fiia-node-silent-alert
+        title: Fiia node silent
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: absent(fiia_alive)
+              instant: true
+              range: false
+            relativeTimeRange:
+              from: 300
+              to: 0
+          - refId: B
+            datasourceUid: __expr__
+            type: reduce
+            model:
+              expression: A
+              reducer: last
+              type: reduce
+              refId: B
+          - refId: C
+            datasourceUid: __expr__
+            type: threshold
+            model:
+              expression: B
+              type: threshold
+              refId: C
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+        for: 30s
+        # absent(fiia_alive) returns empty (no data) while the agent IS alive;
+        # treat that as OK, not an alert. When the agent goes silent, absent()
+        # returns 1 and the rule fires.
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: No fiia.alive series — node silent
+          description: The agent heartbeat is missing; the node may be down or the agent stopped.

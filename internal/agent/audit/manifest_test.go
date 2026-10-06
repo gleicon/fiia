@@ -76,10 +76,10 @@ func TestRunManifestCleanFile(t *testing.T) {
 		t.Fatal("expected ok=true")
 	}
 	if p.Status != "OK" {
-		t.Errorf("status: got %q, want OK; deviations: %v", p.Status, p.TasksChanged)
+		t.Errorf("status: got %q, want OK; deviations: %v", p.Status, p.Deviations)
 	}
-	if len(p.TasksChanged) != 0 {
-		t.Errorf("no deviations expected, got %v", p.TasksChanged)
+	if len(p.Deviations) != 0 {
+		t.Errorf("no deviations expected, got %v", p.Deviations)
 	}
 }
 
@@ -97,11 +97,11 @@ func TestRunManifestMissingFile(t *testing.T) {
 	if p.Status != "DRIFT_DETECTED" {
 		t.Fatalf("status: got %q, want DRIFT_DETECTED", p.Status)
 	}
-	if len(p.TasksChanged) != 1 {
-		t.Fatalf("deviation count: got %d, want 1", len(p.TasksChanged))
+	if len(p.Deviations) != 1 {
+		t.Fatalf("deviation count: got %d, want 1", len(p.Deviations))
 	}
-	if p.TasksChanged[0][:len("file:missing:")] != "file:missing:" {
-		t.Errorf("deviation prefix: got %q, want file:missing:...", p.TasksChanged[0])
+	if p.Deviations[0][:len("file:missing:")] != "file:missing:" {
+		t.Errorf("deviation prefix: got %q, want file:missing:...", p.Deviations[0])
 	}
 }
 
@@ -126,13 +126,13 @@ func TestRunManifestHashMismatch(t *testing.T) {
 		t.Fatalf("status: got %q, want DRIFT_DETECTED", p.Status)
 	}
 	found := false
-	for _, d := range p.TasksChanged {
+	for _, d := range p.Deviations {
 		if len(d) > 14 && d[:14] == "file:hash_mism" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected hash_mismatch deviation, got %v", p.TasksChanged)
+		t.Errorf("expected hash_mismatch deviation, got %v", p.Deviations)
 	}
 }
 
@@ -157,13 +157,13 @@ func TestRunManifestModeMismatch(t *testing.T) {
 		t.Fatalf("status: got %q, want DRIFT_DETECTED", p.Status)
 	}
 	found := false
-	for _, d := range p.TasksChanged {
+	for _, d := range p.Deviations {
 		if len(d) > 14 && d[:14] == "file:mode_mism" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected mode_mismatch deviation, got %v", p.TasksChanged)
+		t.Errorf("expected mode_mismatch deviation, got %v", p.Deviations)
 	}
 }
 
@@ -196,9 +196,9 @@ func TestRunManifestMultipleDeviations(t *testing.T) {
 		SchemaVersion: 1,
 		GeneratedAt:   1700000000,
 		Files: []ManifestFile{
-			{Path: file_path, SHA256: sha256Hex(content), Mode: "644"},              // OK
+			{Path: file_path, SHA256: sha256Hex(content), Mode: "644"},                              // OK
 			{Path: filepath.Join(dir, "missing.conf"), SHA256: sha256Hex([]byte("x")), Mode: "644"}, // missing
-			{Path: file_path, SHA256: sha256Hex([]byte("wrong")), Mode: "644"},       // hash mismatch
+			{Path: file_path, SHA256: sha256Hex([]byte("wrong")), Mode: "644"},                      // hash mismatch
 		},
 	}
 	cfg := cfgWithManifest(writeManifest(t, dir, m))
@@ -206,8 +206,8 @@ func TestRunManifestMultipleDeviations(t *testing.T) {
 	if p.Status != "DRIFT_DETECTED" {
 		t.Fatalf("status: got %q, want DRIFT_DETECTED", p.Status)
 	}
-	if len(p.TasksChanged) != 2 {
-		t.Errorf("deviation count: got %d, want 2; deviations: %v", len(p.TasksChanged), p.TasksChanged)
+	if len(p.Deviations) != 2 {
+		t.Errorf("deviation count: got %d, want 2; deviations: %v", len(p.Deviations), p.Deviations)
 	}
 }
 

@@ -1,0 +1,181 @@
+---
+# Fiia E2E (systemd) stage 2 — drift the tracked service + a tracked file,
+# prove the running daemon detects it, then restore and prove clean.
+#
+# Exercises: svc:inactive / svc:disabled (service-state drift), the daemon's
+# own audit loop reporting DRIFT to its log, and restore-to-clean.
+
+- name: Fiia E2E — drift, daemon detection, restore (systemd)
+  hosts: all
+
+  vars:
+    fiia_install_dir: /usr/local/bin
+    manifest_path: /etc/fiia/manifest.json
+    baseline_content: "{{ lookup('file', baseline_file) }}"
+
+  tasks:
+    - name: Stop and disable the tracked service
+      ansible.builtin.systemd:
+        name: fiia-test.service
+        enabled: false
+        state: stopped
+
+    - name: Drift the sentinel
+      ansible.builtin.copy:
+        content: |
+          # unauthorized edit
+          version: 99
+          state: compromised
+        dest: /etc/fiia/sentinel
+        mode: "0644"
+
+    - name: Wait for the running daemon to report DRIFT to its log
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 20); do
+            if grep "audit:" /var/log/fiia/agent.log | tail -n 1 | grep -q "DRIFT"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      changed_when: false
+
+    - name: One-shot check (expected to detect)
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - "-check"
+          - "-manifest"
+          - "{{ manifest_path }}"
+      register: check_drift
+      changed_when: false
+      failed_when: false
+
+    - name: Assert all three deviations (file + inactive + disabled)
+      ansible.builtin.assert:
+        that:
+          - check_drift.rc == 1
+          - "'file:hash_mismatch:/etc/fiia/sentinel' in check_drift.stdout"
+          - "'svc:inactive:fiia-test' in check_drift.stdout"
+          - "'svc:disabled:fiia-test' in check_drift.stdout"
+        fail_msg: >-
+          expected file+service drift, got rc={{ check_drift.rc }}
+          stdout={{ check_drift.stdout }}
+
+    - name: Show deviations
+      ansible.builtin.debug:
+        msg: "{{ check_drift.stdout_lines }}"
+
+    - name: Restore baseline sentinel
+      ansible.builtin.copy:
+        content: "{{ baseline_content }}"
+        dest: /etc/fiia/sentinel
+        mode: "0644"
+
+    - name: Re-enable and start the tracked service
+      ansible.builtin.systemd:
+        name: fiia-test.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for the daemon to report clean again
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 20); do
+            if grep "audit:" /var/log/fiia/agent.log | tail -n 1 | grep -q "clean"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      changed_when: false
+
+    - name: One-shot check (expected clean)
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - "-check"
+          - "-manifest"
+          - "{{ manifest_path }}"
+      register: check_restored
+      changed_when: false
+      failed_when: check_restored.rc != 0
+
+    - name: Assert clean
+      ansible.builtin.assert:
+        that:
+          - "'OK' in check_restored.stdout"
+        fail_msg: "expected clean after restore, got {{ check_restored.stdout }}"
+
+    - name: Assert fiia-agent still active (watchdog did not kill it)
+      ansible.builtin.systemd:
+        name: fiia-agent
+      register: agent_svc
+
+    - name: Assert still active
+      ansible.builtin.assert:
+        that:
+          - agent_svc.status.ActiveState == "active"
+        fail_msg: "fiia-agent no longer active: {{ agent_svc.status }}"
+
+    # ── permission alert: when systemctl cannot confirm a state (manager query
+    # ── denied / unreachable, rc=4), the agent must alert svc:unverifiable with
+    # ── remediation guidance instead of falsely reporting svc:inactive/svc:disabled
+    - name: Install a fake systemctl that cannot confirm state (rc=4)
+      ansible.builtin.copy:
+        dest: /usr/local/bin/systemctl
+        content: |
+          #!/bin/sh
+          if [ "$1" = "--system" ]; then shift; fi
+          case "$1" in
+            is-active)  echo "inactive"; exit 4 ;;
+            is-enabled) echo "not-found"; exit 4 ;;
+            *) exit 0 ;;
+          esac
+        mode: "0755"
+
+    - name: Run check with the unverifiable manager (expect permission alert)
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - "-check"
+          - "-manifest"
+          - "{{ manifest_path }}"
+      register: check_perm
+      changed_when: false
+      failed_when: false
+
+    - name: Assert svc:unverifiable alert (not a false inactive/disabled)
+      ansible.builtin.assert:
+        that:
+          - check_perm.rc == 1
+          - "'svc:unverifiable:fiia-test' in check_perm.stdout"
+          - "'svc:inactive:fiia-test' not in check_perm.stdout"
+          - "'D-Bus permission denied' in check_perm.stdout"
+        fail_msg: >-
+          expected a permission alert, got rc={{ check_perm.rc }}
+          stdout={{ check_perm.stdout }}
+
+    - name: Remove the fake systemctl
+      ansible.builtin.file:
+        path: /usr/local/bin/systemctl
+        state: absent
+
+    - name: Re-run check (expected clean again)
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - "-check"
+          - "-manifest"
+          - "{{ manifest_path }}"
+      register: check_perm_restored
+      changed_when: false
+      failed_when: check_perm_restored.rc != 0
+
+    - name: Assert clean again after removing the fake systemctl
+      ansible.builtin.assert:
+        that:
+          - "'OK' in check_perm_restored.stdout"
+        fail_msg: "expected clean after removing fake systemctl, got {{ check_perm_restored.stdout }}"

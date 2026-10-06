@@ -1,0 +1,131 @@
+---
+# Fiia E2E stage 2 — introduce drift, verify detection, restore, verify clean.
+# All changes happen inside the throwaway container only.
+#
+#   - overwrite the tracked sentinel        -> file:hash_mismatch
+#   - install an untracked package (curl)   -> pkg:unauthorized:curl (snapshot mode)
+#   - -check must exit 1 with both deviations listed
+#   - restore baseline (sentinel + curl removed) -> -check must exit 0 again
+
+- name: Fiia E2E — drift and detection (Ansible over Docker)
+  hosts: all
+
+  vars:
+    fiia_install_dir: /usr/local/bin
+    manifest_path: /etc/fiia/manifest.json
+    baseline_content: "{{ lookup('file', baseline_file) }}"
+
+  tasks:
+    # ── file drift ──────────────────────────────────────────────────────────────
+
+    - name: Introduce file drift into the sentinel
+      ansible.builtin.copy:
+        content: |
+          # unauthorized edit
+          version: 99
+          state: compromised
+        dest: /etc/fiia/sentinel
+        mode: "0644"
+
+    - name: Run check after file drift (expected to fail)
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - "-check"
+          - "-manifest"
+          - "{{ manifest_path }}"
+      register: check_file_drift
+      changed_when: false
+      failed_when: false
+
+    - name: Assert file drift detected (rc=1, hash_mismatch on the sentinel)
+      ansible.builtin.assert:
+        that:
+          - check_file_drift.rc == 1
+          - "'DRIFT' in check_file_drift.stdout"
+          - "'file:hash_mismatch:/etc/fiia/sentinel' in check_file_drift.stdout"
+        fail_msg: >-
+          expected file drift, got rc={{ check_file_drift.rc }}
+          stdout={{ check_file_drift.stdout }}
+
+    # ── package drift (snapshot-unauthorized) ──────────────────────────────────
+
+    - name: Install an untracked package (curl)
+      ansible.builtin.apt:
+        name: curl
+        state: present
+        update_cache: true
+
+    - name: Run check after package drift (expected to fail)
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - "-check"
+          - "-manifest"
+          - "{{ manifest_path }}"
+      register: check_pkg_drift
+      changed_when: false
+      failed_when: false
+
+    - name: Assert package drift detected (rc=1, pkg:unauthorized:curl)
+      ansible.builtin.assert:
+        that:
+          - check_pkg_drift.rc == 1
+          - "'pkg:unauthorized:curl' in check_pkg_drift.stdout"
+        fail_msg: >-
+          expected package drift, got rc={{ check_pkg_drift.rc }}
+          stdout={{ check_pkg_drift.stdout }}
+
+    - name: Show all deviations
+      ansible.builtin.debug:
+        msg: "{{ check_pkg_drift.stdout_lines }}"
+
+    # ── remediation (explicitly authorized, off by default) ─────────────────────
+    # The agent enforces the manifest for packages; file deviations remain the
+    # provisioning playbook's job (IaS is the source of truth for file content).
+    - name: Enforce the manifest with -remediate
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - "-check"
+          - "-remediate"
+          - "-manifest"
+          - "{{ manifest_path }}"
+      register: remediated
+      changed_when: false
+      failed_when: false
+
+    - name: Assert remediation removed curl but left the file deviation
+      ansible.builtin.assert:
+        that:
+          - "'remediate:' in remediated.stdout"
+          - "'pkg:unauthorized:curl' not in remediated.stdout"
+          - "'file:hash_mismatch:/etc/fiia/sentinel' in remediated.stdout"
+        fail_msg: "unexpected remediation result: {{ remediated.stdout }}"
+
+    - name: Restore the file baseline (the IaS fix for file deviations)
+      ansible.builtin.copy:
+        content: "{{ baseline_content }}"
+        dest: /etc/fiia/sentinel
+        mode: "0644"
+
+    - name: Re-run check (expected clean)
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - "-check"
+          - "-manifest"
+          - "{{ manifest_path }}"
+      register: check_restored
+      changed_when: false
+      failed_when: check_restored.rc != 0
+
+    - name: Assert restored clean
+      ansible.builtin.assert:
+        that:
+          - "'OK' in check_restored.stdout"
+        fail_msg: "expected clean after restore, got {{ check_restored.stdout }}"
+
+    - name: Report restored verdict
+      ansible.builtin.debug:
+        msg: "restored clean: {{ check_restored.stdout | regex_search('OK: .*') }}"

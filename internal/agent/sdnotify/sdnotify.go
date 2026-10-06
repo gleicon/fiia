@@ -1,21 +1,16 @@
 package sdnotify
 
 import (
+	"github.com/gleicon/fiia/internal/assert"
 	"log"
 	"net"
 	"os"
 )
 
-func assert(condition bool, message string) {
-	if !condition {
-		panic("agent/sdnotify: assertion failed: " + message)
-	}
-}
-
 // Notify sends a state string to the systemd notification socket.
 // No-ops silently if NOTIFY_SOCKET is not set (daemon not managed by systemd).
 func Notify(state string) {
-	assert(state != "", "state must not be empty")
+	assert.True(state != "", "state must not be empty")
 
 	socket_path := os.Getenv("NOTIFY_SOCKET")
 	if socket_path == "" {

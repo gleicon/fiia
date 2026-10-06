@@ -1,0 +1,107 @@
+---
+# Fiia E2E (systemd) stage 1 — provision the agent via the fiia.fleet.agent role
+# inside a systemd-capable container, plus a tracked service for service drift.
+#
+# Exercises: role install (user, config, binary, systemd unit, logrotate),
+# sd_notify readiness (Type=notify service reaching 'active'), watchdog config,
+# manifest recording with a declared service, and the role's clean baseline check.
+#
+# Run via: ./e2e/systemd/run.sh  (or: make e2e-systemd)
+
+- name: Fiia E2E — provision agent + tracked service (systemd)
+  hosts: all
+
+  vars:
+    fiia_agent_binary: "{{ agent_binary }}"
+    fiia_heartbeat_interval_sec: 5
+    fiia_audit_interval_sec: 5
+    fiia_audit_jitter_max_sec: 1
+    fiia_manifest_snapshot: false
+    fiia_manifest_files:
+      - /etc/fiia/sentinel
+      - /etc/motd
+    fiia_manifest_services:
+      - fiia-test
+    baseline_content: "{{ lookup('file', baseline_file) }}"
+
+  tasks:
+    - name: Create fiia config directory
+      ansible.builtin.file:
+        path: /etc/fiia
+        state: directory
+        mode: "0755"
+
+    - name: Create the tracked test service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/fiia-test.service
+        content: |
+          [Unit]
+          Description=fiia e2e tracked service
+          [Service]
+          ExecStart=/bin/sleep infinity
+          Restart=no
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start the tracked test service
+      ansible.builtin.systemd:
+        name: fiia-test.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Write baseline files
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - dest: /etc/fiia/sentinel
+          content: "{{ baseline_content }}"
+        - dest: /etc/motd
+          content: "Authorized access only. Activity is monitored by Fiia.\n"
+
+    - name: Apply the fiia agent role
+      ansible.builtin.include_role:
+        name: fiia.fleet.agent
+
+    - name: Read fiia-agent service state
+      ansible.builtin.systemd:
+        name: fiia-agent
+      register: agent_svc
+
+    - name: Assert active (Type=notify => sd_notify READY was accepted) + enabled
+      ansible.builtin.assert:
+        that:
+          - agent_svc.status.ActiveState == "active"
+          - agent_svc.status.SubState == "running"
+          - agent_svc.status.UnitFileState == "enabled"
+        fail_msg: "fiia-agent not active/enabled: {{ agent_svc.status }}"
+
+    - name: Capture watchdog configuration
+      ansible.builtin.command:
+        argv: ["systemctl", "show", "-p", "WatchdogUSec", "--value", "fiia-agent"]
+      register: watchdog
+      changed_when: false
+
+    - name: Assert watchdog is 120s (WatchdogSec=120 in the unit)
+      ansible.builtin.assert:
+        that:
+          - watchdog.stdout in ["120000000", "2min"]
+        fail_msg: "unexpected WatchdogUSec: {{ watchdog.stdout }}"
+
+    - name: Stat install artifacts
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/systemd/system/fiia-agent.service
+        - /etc/logrotate.d/fiia
+        - /etc/fiia/agent.toml
+        - /etc/fiia/manifest.json
+      register: artifacts
+
+    - name: Assert unit, logrotate, config, and manifest exist
+      ansible.builtin.assert:
+        that:
+          - (artifacts.results | map(attribute='stat') | map(attribute='exists') | list) is all
+        fail_msg: "install artifacts missing: {{ artifacts.results }}"

@@ -6,16 +6,123 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	agentcfg "github.com/gleicon/fiia/internal/agent/config"
-	"github.com/gleicon/fiia/internal/wire"
+	"github.com/gleicon/fiia/internal/assert"
 )
 
+// Check status values emitted for every manifest verification.
 const (
-	// manifest_stale_days: warn when manifest has not been regenerated within this window.
-	manifest_stale_days = 90
+	StatusOK               = "OK"
+	StatusDriftDetected    = "DRIFT_DETECTED"
+	StatusManifestNotFound = "MANIFEST_NOT_FOUND"
+	StatusCheckError       = "CHECK_ERROR"
 )
+
+// ManifestStaleDays warns when the manifest has not been regenerated
+// within this window. The check is advisory (stderr); it never changes
+// the OK/DRIFT verdict.
+const ManifestStaleDays = 90
+
+// Remediation summarizes what one manifest-enforcement pass changed.
+// Auto-remediation is NEVER on by default: it only runs when explicitly
+// authorized (-remediate / remediate=true). Files are intentionally not in
+// the agent's remediation scope — restoring file content is the provisioning
+// playbook's job (IaS is the source of truth for file content).
+type Remediation struct {
+	PackagesRemoved  []string
+	ServicesStarted  []string
+	ServicesStopped  []string
+	ServicesEnabled  []string
+	ServicesDisabled []string
+}
+
+// Empty reports whether the remediation pass made no changes.
+func (r Remediation) Empty() bool {
+	return len(r.PackagesRemoved) == 0 &&
+		len(r.ServicesStarted) == 0 &&
+		len(r.ServicesStopped) == 0 &&
+		len(r.ServicesEnabled) == 0 &&
+		len(r.ServicesDisabled) == 0
+}
+
+// String renders the remediation as a single human-readable line.
+func (r Remediation) String() string {
+	var parts []string
+	if n := len(r.PackagesRemoved); n > 0 {
+		parts = append(parts, fmt.Sprintf("removed %d package(s): %s", n, strings.Join(r.PackagesRemoved, ", ")))
+	}
+	if n := len(r.ServicesStarted); n > 0 {
+		parts = append(parts, fmt.Sprintf("started %d service(s): %s", n, strings.Join(r.ServicesStarted, ", ")))
+	}
+	if n := len(r.ServicesStopped); n > 0 {
+		parts = append(parts, fmt.Sprintf("stopped %d service(s): %s", n, strings.Join(r.ServicesStopped, ", ")))
+	}
+	if n := len(r.ServicesEnabled); n > 0 {
+		parts = append(parts, fmt.Sprintf("enabled %d service(s): %s", n, strings.Join(r.ServicesEnabled, ", ")))
+	}
+	if n := len(r.ServicesDisabled); n > 0 {
+		parts = append(parts, fmt.Sprintf("disabled %d service(s): %s", n, strings.Join(r.ServicesDisabled, ", ")))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// unauthorizedSet returns the elements of current that are not in allowed.
+func unauthorizedSet(allowed, current []string) []string {
+	allow := make(map[string]bool, len(allowed))
+	for _, a := range allowed {
+		allow[a] = true
+	}
+	var out []string
+	for _, c := range current {
+		if !allow[c] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// RemediatePath loads the manifest at path and enforces it (see Remediate).
+// Only meaningful when the caller has explicitly authorized remediation.
+func RemediatePath(path string) (Remediation, error) {
+	assert.True(path != "", "path must not be empty")
+	m, err := loadManifest(path)
+	if err != nil {
+		return Remediation{}, err
+	}
+	return Remediate(m), nil
+}
+
+const secsPerDay = 86400
+
+// CheckResult is the verdict of one manifest verification.
+type CheckResult struct {
+	NodeID              string
+	TimestampUnix       int64
+	Status              string
+	Deviations          []string
+	ManifestGeneratedAt int64
+}
+
+// Timestamp returns the check time as a time.Time.
+func (r CheckResult) Timestamp() time.Time {
+	return time.Unix(r.TimestampUnix, 0)
+}
+
+// ManifestAgeDays returns the whole-day age of a manifest generation timestamp.
+func ManifestAgeDays(nowUnix, generatedAt int64) int64 {
+	if generatedAt <= 0 {
+		return 0
+	}
+	return (nowUnix - generatedAt) / secsPerDay
+}
+
+// IsManifestStale reports whether the manifest is older than ManifestStaleDays.
+func IsManifestStale(nowUnix, generatedAt int64) bool {
+	return ManifestAgeDays(nowUnix, generatedAt) > ManifestStaleDays
+}
 
 // ManifestFile is one file entry in the manifest.
 type ManifestFile struct {
@@ -51,34 +158,32 @@ type Manifest struct {
 }
 
 // RunManifest reads the manifest at cfg.ManifestPath, checks live system state,
-// and returns a DriftPayload. Returns (payload, false) if manifest path is empty.
-func RunManifest(cfg *agentcfg.AgentConfig) (wire.DriftPayload, bool) {
-	assert(cfg != nil, "cfg must not be nil")
-	assert(cfg.NodeID != "", "node_id must not be empty")
+// and returns a CheckResult. Returns (result, false) if manifest path is empty.
+func RunManifest(cfg *agentcfg.AgentConfig) (CheckResult, bool) {
+	assert.True(cfg != nil, "cfg must not be nil")
+	assert.True(cfg.NodeID != "", "node_id must not be empty")
 
 	if cfg.ManifestPath == "" {
-		return wire.DriftPayload{}, false
+		return CheckResult{}, false
 	}
 
-	payload := wire.DriftPayload{
+	result := CheckResult{
 		NodeID:        cfg.NodeID,
 		TimestampUnix: time.Now().Unix(),
 	}
 
 	m, err := loadManifest(cfg.ManifestPath)
 	if err != nil {
-		payload.Status = "MANIFEST_NOT_FOUND"
-		return payload, true
+		result.Status = StatusManifestNotFound
+		return result, true
 	}
 
-	if m.GeneratedAt > 0 {
-		age_days := (time.Now().Unix() - m.GeneratedAt) / 86400
-		if age_days > manifest_stale_days {
-			fmt.Printf("audit: manifest is %d days old — re-run provisioning playbook to refresh\n", age_days)
-		}
+	if m.GeneratedAt > 0 && IsManifestStale(time.Now().Unix(), m.GeneratedAt) {
+		age_days := ManifestAgeDays(time.Now().Unix(), m.GeneratedAt)
+		fmt.Printf("audit: manifest is %d days old — re-run provisioning playbook to refresh\n", age_days)
 	}
 
-	payload.ManifestGeneratedAt = m.GeneratedAt
+	result.ManifestGeneratedAt = m.GeneratedAt
 
 	var deviations []string
 	deviations = append(deviations, checkFiles(m.Files)...)
@@ -88,18 +193,18 @@ func RunManifest(cfg *agentcfg.AgentConfig) (wire.DriftPayload, bool) {
 	deviations = append(deviations, checkUnauthorizedServices(m.ServiceSnapshot)...)
 
 	if len(deviations) > 0 {
-		payload.Status = "DRIFT_DETECTED"
-		payload.TasksChanged = deviations
+		result.Status = StatusDriftDetected
+		result.Deviations = deviations
 	} else {
-		payload.Status = "OK"
+		result.Status = StatusOK
 	}
-	return payload, true
+	return result, true
 }
 
 // ProbeManifest verifies the manifest file exists and is parseable.
 // Returns nil if manifest path is empty (manifest check disabled).
 func ProbeManifest(cfg *agentcfg.AgentConfig) error {
-	assert(cfg != nil, "cfg must not be nil")
+	assert.True(cfg != nil, "cfg must not be nil")
 
 	if cfg.ManifestPath == "" {
 		return nil
@@ -109,7 +214,7 @@ func ProbeManifest(cfg *agentcfg.AgentConfig) error {
 }
 
 func loadManifest(path string) (Manifest, error) {
-	assert(path != "", "path must not be empty")
+	assert.True(path != "", "path must not be empty")
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -136,8 +241,8 @@ func checkFiles(files []ManifestFile) []string {
 }
 
 func checkFile(f ManifestFile) error {
-	assert(f.Path != "", "file path must not be empty")
-	assert(f.SHA256 != "", "file sha256 must not be empty")
+	assert.True(f.Path != "", "file path must not be empty")
+	assert.True(f.SHA256 != "", "file sha256 must not be empty")
 
 	info, err := os.Stat(f.Path)
 	if os.IsNotExist(err) {
@@ -169,7 +274,7 @@ func checkFile(f ManifestFile) error {
 }
 
 func sha256File(path string) (string, error) {
-	assert(path != "", "path must not be empty")
+	assert.True(path != "", "path must not be empty")
 
 	fh, err := os.Open(path)
 	if err != nil {

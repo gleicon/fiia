@@ -38,3 +38,19 @@ dev/drift.log
 # Test output
 *.test
 coverage.out
+
+# Generated dev inventory (make dev-inventory)
+deploy/ansible/inventory/dev.ini
+
+# E2E collector output (./e2e/run.sh)
+e2e/out/
+
+# Ansible E2E agent binary (built by e2e/ansible/run.sh)
+e2e/ansible/bin/
+
+# Ansible E2E collection staging symlink (built by run.sh)
+e2e/ansible/collections/
+
+# systemd E2E agent binary + collection staging (built by run.sh)
+e2e/systemd/bin/
+e2e/systemd/collections/

@@ -36,7 +36,7 @@ if [[ "$OS" == "Linux" ]]; then
   } > "$BACKEND_FILE"
   echo "Written: $BACKEND_FILE"
   echo ""
-  echo "Next: make dev-hub  (in one terminal)"
+  echo "Next: make dev-deploy"
   echo "      make dev-deploy"
   exit 0
 fi
@@ -124,7 +124,7 @@ lima)
     STATUS="$(limactl list 2>/dev/null | awk -v n="$VM_NAME" '$1==n{print $2}')"
     echo "Lima VM '$VM_NAME' exists (status: ${STATUS:-unknown})"
     if [[ "${STATUS:-}" == "Running" ]]; then
-      echo "Ready. Run: make dev-hub  (terminal 1)  &&  make dev-deploy"
+      echo "Ready. Run: make dev-deploy"
     else
       echo "Next: make dev-vm-start"
     fi
@@ -136,7 +136,7 @@ lima)
 colima)
   if colima status >/dev/null 2>&1; then
     echo "Colima is running. Ready."
-    echo "Next: make dev-hub  (terminal 1)  &&  make dev-deploy"
+    echo "Next: make dev-deploy"
   else
     echo "Next: make dev-vm-start  &&  make dev-deploy"
   fi

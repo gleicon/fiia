@@ -1,0 +1,23 @@
+# E2E stage 1: build the agent from this repo.
+FROM golang:1.26-bookworm AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /fiia-agent ./cmd/agent
+
+# E2E stage 2: minimal Debian target with a provisioned baseline.
+FROM debian:bookworm-slim
+RUN apt-get update -q \
+  && apt-get install -y -q --no-install-recommends ca-certificates dpkg \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /fiia-agent /usr/local/bin/fiia-agent
+COPY e2e/agent.toml /etc/fiia/agent.toml
+COPY e2e/baseline/sentinel.txt /etc/fiia/sentinel
+RUN mkdir -p /etc/fiia \
+  && printf 'Authorized access only.\n' > /etc/motd \
+  && /usr/local/bin/fiia-agent -write-manifest \
+    -manifest /etc/fiia/manifest.json \
+    -files /etc/fiia/sentinel,/etc/motd \
+    -packages bash -snapshot
+CMD ["/usr/local/bin/fiia-agent", "-config", "/etc/fiia/agent.toml"]

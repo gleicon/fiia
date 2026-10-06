@@ -1,0 +1,80 @@
+---
+# Fiia E2E stage 1 — provision the baseline with Ansible.
+# Runs against a throwaway Docker container via the community.docker
+# connection plugin; nothing on the host or any VM is touched.
+#
+#   - installs fiia-agent
+#   - writes the baseline files (content from the shared e2e/baseline/sentinel.txt)
+#   - records the drift manifest with the agent binary -write-manifest (snapshot mode)
+#   - verifies -check reads clean (rc=0) and reports OK
+#
+# Run via: ./e2e/ansible/run.sh  (or: make e2e-ansible)
+
+- name: Fiia E2E — provision baseline (Ansible over Docker)
+  hosts: all
+
+  vars:
+    fiia_install_dir: /usr/local/bin
+    fiia_config_dir: /etc/fiia
+    manifest_path: /etc/fiia/manifest.json
+    baseline_content: "{{ lookup('file', baseline_file) }}"
+
+  tasks:
+    - name: Create config directory
+      ansible.builtin.file:
+        path: "{{ fiia_config_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Install fiia-agent binary
+      ansible.builtin.copy:
+        src: "{{ fiia_agent_binary }}"
+        dest: "{{ fiia_install_dir }}/fiia-agent"
+        mode: "0755"
+
+    - name: Write baseline sentinel
+      ansible.builtin.copy:
+        content: "{{ baseline_content }}"
+        dest: /etc/fiia/sentinel
+        mode: "0644"
+
+    - name: Write baseline motd
+      ansible.builtin.copy:
+        content: "Authorized access only. Activity is monitored by Fiia.\n"
+        dest: /etc/motd
+        mode: "0644"
+
+    - name: Record drift manifest (last provisioning step, snapshot mode)
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - -write-manifest
+          - -manifest
+          - "{{ manifest_path }}"
+          - -files
+          - /etc/fiia/sentinel,/etc/motd
+          - -snapshot
+      register: fiia_record
+      changed_when: "'wrote ' in fiia_record.stdout"
+
+    - name: Verify baseline reads clean
+      ansible.builtin.command:
+        argv:
+          - "{{ fiia_install_dir }}/fiia-agent"
+          - "-check"
+          - "-manifest"
+          - "{{ manifest_path }}"
+      register: check_clean
+      changed_when: false
+      failed_when: check_clean.rc != 0
+
+    - name: Assert clean verdict names the tracked files and package snapshot
+      ansible.builtin.assert:
+        that:
+          - "'OK' in check_clean.stdout"
+          - "'files=2' in check_clean.stdout"
+        fail_msg: "expected clean verdict, got {{ check_clean.stdout }}"
+
+    - name: Report clean verdict
+      ansible.builtin.debug:
+        msg: "baseline clean: {{ check_clean.stdout | regex_search('OK: .*') }}"

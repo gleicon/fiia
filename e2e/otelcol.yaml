@@ -1,0 +1,27 @@
+# OTel collector for the E2E flow: OTLP/HTTP in, human-readable debug logs, a
+# JSON file the test script asserts against, and a Prometheus scrape endpoint
+# (port 9464) for the live observability stack (prometheus + grafana).
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  debug:
+    verbosity: detailed
+  file:
+    path: /tmp/e2e-out/telemetry.json
+    append: true
+  prometheus:
+    endpoint: 0.0.0.0:9464
+    add_metric_suffixes: false
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [debug, file, prometheus]
+    logs:
+      receivers: [otlp]
+      exporters: [debug, file]

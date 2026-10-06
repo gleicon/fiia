@@ -1,0 +1,7 @@
+[agent]
+node_id = "e2e-node"
+manifest_path = "/etc/fiia/manifest.json"
+heartbeat_interval_sec = 5
+audit_interval_sec = 10
+audit_jitter_max_sec = 2
+# OTLP endpoint comes from the OTEL_EXPORTER_OTLP_ENDPOINT env (see docker-compose.yml).

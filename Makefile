@@ -1,9 +1,9 @@
-.PHONY: build test test-linux lint \
+.PHONY: build test test-linux lint e2e e2e-ansible e2e-systemd e2e-live e2e-live-down e2e-live-webhook \
         dev-init dev-setup dev-vm-create dev-vm-start dev-vm-stop dev-vm-status \
-        dev-build dev-certs dev-certs-force \
-        dev-inventory dev-hub dev-deploy dev-run dev-logs dev-drift-log \
+        dev-build \
+        dev-inventory dev-deploy dev-run dev-logs \
         dev-journal dev-watch dev-stop \
-        dev-drift dev-restore dev-check-drift dev-collection-test
+        dev-drift dev-restore dev-check-drift
 
 # ── build ──────────────────────────────────────────────────────────────────────
 
@@ -15,6 +15,28 @@ test:
 
 test-linux:
 	dev/test-linux.sh $(ARGS)
+
+e2e:
+	bash e2e/run.sh
+
+e2e-ansible:
+	bash e2e/ansible/run.sh
+
+e2e-systemd:
+	bash e2e/systemd/run.sh
+
+# Live observability run: daemon -> collector -> Prometheus -> Grafana.
+# Keeps the stack running for real-time viewing. Tear down with e2e-live-down.
+e2e-live:
+	bash e2e/observe/run.sh
+
+e2e-live-down:
+	bash e2e/observe/run.sh down
+
+# Optional local webhook listener: prints Grafana alert notifications as they
+# fire during e2e-live. Ctrl+C to stop.
+e2e-live-webhook:
+	bash e2e/observe/run-webhook.sh
 
 # ── VM backend ─────────────────────────────────────────────────────────────────
 # Backend is detected once by running: make dev-setup
@@ -66,20 +88,17 @@ ANSIBLE_PLAYBOOK ?= $(if $(ANSIBLE_DIRECT),$(ANSIBLE_BIN),\
 
 LINUX_BINARY := fiia-agent-linux-$(LINUX_GOARCH)
 DEV_NODE_ID  := $(shell $(VM) node-id 2>/dev/null || echo dev-node)
-DEV_SECRET   := 0000000000000000000000000000000000000000000000000000000000000001
 
 # ── dev setup ──────────────────────────────────────────────────────────────────
 # dev-init: one-shot first-time setup (detect backend, create VM, start it)
-# After this: open two terminals — run `make dev-hub` in one, `make dev-deploy` in the other.
+# After this: run `make dev-deploy` to provision the agent on the target.
 
 dev-init:
 	bash dev/setup.sh
 	$(VM) create
 	$(VM) start
 	@echo ""
-	@echo "VM ready. Next:"
-	@echo "  terminal 1: make dev-hub"
-	@echo "  terminal 2: make dev-deploy"
+	@echo "VM ready. Next: make dev-deploy"
 
 dev-setup:
 	bash dev/setup.sh
@@ -104,14 +123,6 @@ dev-build:
 	GOOS=linux GOARCH=$(LINUX_GOARCH) CGO_ENABLED=0 \
 	  go build -o $(LINUX_BINARY) ./cmd/agent
 	@echo "built $(LINUX_BINARY)"
-
-dev-certs:
-	go run ./dev/gen_certs
-	@echo "certs in dev/ca/ (no-op if already present; use dev-certs-force to rotate)"
-
-dev-certs-force:
-	go run ./dev/gen_certs -- --force
-	@echo "certs rotated in dev/ca/ — restart hub and redeploy agents"
 
 # ── dev inventory ──────────────────────────────────────────────────────────────
 
@@ -139,21 +150,16 @@ dev-inventory:
 
 # ── dev hub ────────────────────────────────────────────────────────────────────
 
-dev-hub: dev-certs
-	go run ./cmd/hub \
-	  -config dev/hub.toml \
-	  -seed-node "$(DEV_NODE_ID):$(DEV_SECRET)"
-
 # ── dev deploy ─────────────────────────────────────────────────────────────────
 
 dev-deploy: dev-build dev-inventory
 	@test -n "$(ANSIBLE_PLAYBOOK)" || \
 	  { echo "ERROR: ansible-playbook not found. Fix: brew install ansible  OR  pip3 install ansible"; exit 1; }
+	ANSIBLE_COLLECTIONS_PATHS=$(CURDIR)/ansible/collections \
 	$(ANSIBLE_PLAYBOOK) \
 	  -i deploy/ansible/inventory/dev.ini \
 	  -e "fiia_agent_binary=$(CURDIR)/$(LINUX_BINARY)" \
 	  -e "fiia_node_id=$(DEV_NODE_ID)" \
-	  -e "fiia_hub_hmac_secret_hex=$(DEV_SECRET)" \
 	  deploy/ansible/dev-bootstrap.yml
 
 # ── dev observe ────────────────────────────────────────────────────────────────
@@ -164,15 +170,11 @@ dev-run:
 dev-logs:
 	$(VM) shell sudo tail -f /var/log/fiia/agent.log
 
-dev-drift-log:
-	$(VM) shell sudo tail -f /var/log/fiia/drift.log
-
 dev-journal:
 	$(VM) shell sudo journalctl -u fiia-agent -f
 
 dev-watch:
-	$(VM) shell sudo tail -f /var/log/fiia/agent.log /var/log/fiia/drift.log \
-	  | awk '/^==> /{split($$2,a,"/"); src=a[length(a)]; next} {print src": "$$0}'
+	$(VM) shell sudo journalctl -u fiia-agent -f
 
 dev-stop:
 	$(VM) shell sudo systemctl stop fiia-agent
@@ -197,48 +199,8 @@ dev-restore:
 	@echo "Baseline restored."
 
 dev-check-drift:
-	@echo "=== node status ==="
-	@curl -sf http://localhost:9091/nodes/$(DEV_NODE_ID)/status \
-	  | python3 -m json.tool 2>/dev/null || echo "(not reachable — is hub running?)"
+	@echo "=== on-node verdict (exit 0 clean, 1 drift) ==="
+	$(VM) shell sudo /usr/local/bin/fiia-agent -check -manifest /etc/fiia/manifest.json; true
 	@echo ""
-	@echo "=== drift events (last 10) ==="
-	@curl -sf http://localhost:9091/nodes/$(DEV_NODE_ID)/drift \
-	  | python3 -m json.tool 2>/dev/null || echo "(no events yet)"
-	@echo ""
-	@echo "=== alerts ==="
-	@curl -sf http://localhost:9091/alerts \
-	  | python3 -m json.tool 2>/dev/null || echo "(no alerts)"
-
-# ── collection module test (Docker) ───────────────────────────────────────────
-# Tests fiia.fleet.manifest against a real Ubuntu container via docker exec.
-# No VM or SSH needed — works wherever Docker is available.
-#
-# Requires: docker  +  ansible-galaxy collection install community.docker
-
-DOCKER          := $(shell which docker 2>/dev/null)
-DOCKER_CTR      := fiia-collection-test
-COLLECTION_PATH := $(CURDIR)/ansible/collections
-
-dev-collection-test:
-	@test -n "$(DOCKER)" || \
-	  { echo "ERROR: docker not found. Install Docker Desktop, OrbStack, or Colima."; exit 1; }
-	@test -n "$(ANSIBLE_PLAYBOOK)" || \
-	  { echo "ERROR: ansible-playbook not found. Fix: brew install ansible"; exit 1; }
-	@ansible-galaxy collection list 2>/dev/null | grep -q 'community\.docker' || \
-	  { echo "Installing community.docker collection..."; ansible-galaxy collection install community.docker; }
-	@echo "=== starting Ubuntu container ==="
-	@docker rm -f $(DOCKER_CTR) 2>/dev/null || true
-	docker run -d --name $(DOCKER_CTR) ubuntu:24.04 sleep infinity
-	@echo "=== installing test dependencies ==="
-	docker exec $(DOCKER_CTR) bash -c \
-	  "apt-get update -q && apt-get install -y -q --no-install-recommends python3 openssh-server"
-	@echo "=== running manifest module tests ==="
-	ANSIBLE_COLLECTIONS_PATHS=$(COLLECTION_PATH) \
-	$(ANSIBLE_PLAYBOOK) \
-	  -i "$(DOCKER_CTR)," \
-	  -e "ansible_connection=community.docker.docker" \
-	  -e "ansible_python_interpreter=/usr/bin/python3" \
-	  deploy/ansible/collection-test.yml ; \
-	STATUS=$$? ; \
-	docker rm -f $(DOCKER_CTR) ; \
-	exit $$STATUS
+	@echo "=== recent agent log (OTel export target) ==="
+	$(VM) shell sudo tail -n 20 /var/log/fiia/agent.log

@@ -1,0 +1,18 @@
+# Prometheus config for the live Fiia E2E stack. Scrapes the OTel collector's
+# Prometheus exporter (:9464) and evaluates Fiia alert rules:
+#   - FiiaDriftDetected  fiia_drift_status > 0  (drift/check error)
+#   - FiiaNodeSilent     absent(fiia_alive)     (no heartbeat series)
+global:
+  scrape_interval: 5s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: fiia
+    static_configs:
+      - targets: ["otelcol:9464"]
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+alerting:
+  alertmanagers: []

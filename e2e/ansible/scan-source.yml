@@ -1,0 +1,22 @@
+---
+# Canonical drift surface for the E2E scan test: the playbook that "manages"
+# the tracked files. -scan-playbook must derive /etc/fiia/sentinel and
+# /etc/motd from this (no templated dest, no loops).
+# Used by e2e/ansible/run.sh stage 0 (host scan) and the scan-driven manifest
+# E2E inside the container.
+
+- name: Fiia E2E — managed files (scan source)
+  hosts: all
+
+  tasks:
+    - name: Write baseline sentinel
+      ansible.builtin.copy:
+        content: "{{ lookup('file', baseline_file) }}"
+        dest: /etc/fiia/sentinel
+        mode: "0644"
+
+    - name: Write baseline motd
+      ansible.builtin.copy:
+        content: "Authorized access only. Activity is monitored by Fiia.\n"
+        dest: /etc/motd
+        mode: "0644"

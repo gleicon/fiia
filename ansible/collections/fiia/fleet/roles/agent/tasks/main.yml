@@ -7,7 +7,7 @@
     create_home: false
     state: present
 
-- name: Create config, log, and state directories
+- name: Create config and log directories
   ansible.builtin.file:
     path: "{{ item.path }}"
     state: directory
@@ -17,19 +17,8 @@
   loop:
     - { path: "{{ fiia_config_dir }}", owner: root, mode: "0755" }
     - { path: "{{ fiia_log_dir }}", owner: "{{ fiia_user }}", mode: "0750" }
-    - { path: /var/lib/fiia, owner: "{{ fiia_user }}", mode: "0700" }
-    - { path: /var/lib/fiia/queue, owner: "{{ fiia_user }}", mode: "0700" }
-    - { path: /var/lib/fiia/.ansible/tmp, owner: "{{ fiia_user }}", mode: "0700" }
 
-- name: Deploy root CA certificate
-  ansible.builtin.copy:
-    content: "{{ fiia_ca_cert }}"
-    dest: "{{ fiia_config_dir }}/root_ca.pem"
-    owner: root
-    group: root
-    mode: "0644"
-
-- name: Write agent configuration (contains HMAC secret — mode 0400)
+- name: Write agent configuration (0400)
   ansible.builtin.template:
     src: agent.toml.j2
     dest: "{{ fiia_config_dir }}/agent.toml"
@@ -66,6 +55,26 @@
     group: root
     mode: "0644"
 
+- name: Build manifest record command
+  ansible.builtin.set_fact:
+    fiia_record_argv: "{{ [fiia_install_dir ~ '/fiia-agent', '-write-manifest', '-manifest', fiia_manifest_path, '-files', (fiia_manifest_files | join(',')), '-packages', (fiia_manifest_packages | join(',')), '-services', (fiia_manifest_services | join(','))] + (['-snapshot'] if fiia_manifest_snapshot else []) }}"
+  when: fiia_manage_manifest
+
+- name: Record drift manifest (last provisioning step)
+  ansible.builtin.command:
+    argv: "{{ fiia_record_argv }}"
+  register: fiia_record
+  changed_when: "'wrote ' in fiia_record.stdout"
+  when: fiia_manage_manifest
+
+- name: Make manifest readable by the fiia service account (still 0400)
+  ansible.builtin.file:
+    path: "{{ fiia_manifest_path }}"
+    owner: "{{ fiia_user }}"
+    group: root
+    mode: "0400"
+  when: fiia_manage_manifest
+
 - name: Enable and start fiia-agent
   ansible.builtin.systemd:
     name: fiia-agent
@@ -73,11 +82,14 @@
     state: started
     daemon_reload: true
 
-- name: Wait for node to appear in hub registry (post-deploy handshake)
-  ansible.builtin.uri:
-    url: "http://{{ fiia_hub_api_addr }}/nodes/{{ inventory_hostname }}/status"
-    status_code: 200
-  register: handshake_result
-  retries: 6
-  delay: 30
-  until: handshake_result.status == 200
+- name: Verify baseline reads clean
+  ansible.builtin.command:
+    argv:
+      - "{{ fiia_install_dir }}/fiia-agent"
+      - -check
+      - -manifest
+      - "{{ fiia_manifest_path }}"
+  register: fiia_check
+  changed_when: false
+  failed_when: fiia_check.rc != 0
+  when: fiia_manage_manifest

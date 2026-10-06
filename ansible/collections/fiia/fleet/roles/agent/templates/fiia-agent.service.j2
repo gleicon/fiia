@@ -1,6 +1,6 @@
 [Unit]
-Description=Fiia agent - fleet telemetry and drift detection
-After=network-online.target
+Description=Fiia agent - configuration drift detection
+After=network-online.target dbus.service
 Wants=network-online.target
 
 [Service]
@@ -9,9 +9,9 @@ User={{ fiia_user }}
 ExecStart={{ fiia_install_dir }}/fiia-agent -config {{ fiia_config_dir }}/agent.toml
 Restart=on-failure
 RestartSec=30
-
-Environment=HOME=/var/lib/fiia
-Environment=ANSIBLE_CONFIG=/var/lib/fiia/ansible.cfg
+{% if fiia_otlp_endpoint is defined and fiia_otlp_endpoint %}
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT={{ fiia_otlp_endpoint }}
+{% endif %}
 
 CPUQuota=10%
 MemoryMax=256M
@@ -25,7 +25,7 @@ WatchdogSec=120
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths={{ fiia_log_dir }} /var/lib/fiia
+ReadWritePaths={{ fiia_log_dir }}
 PrivateTmp=true
 CapabilityBoundingSet=
 
