@@ -1,9 +1,8 @@
 # Fiia — Configuration Drift Detection for Ansible-Managed Servers
 
-You provision with Ansible. Fiia checks that servers still match what you
-provisioned — files, packages, services — and reports to your OpenTelemetry
-pipeline. No hub, no secrets. Detection first; remediation is an explicit
-opt-in (`-remediate` / `remediate = true`), never the default.
+After provisioning with Ansible, Fiia checks that servers still match what you
+provisioned (files, packages, services) and reports to your OpenTelemetry
+pipeline.
 
 ## Quick start
 
@@ -83,9 +82,12 @@ manifest_path = "/etc/fiia/manifest.json"
 | [docs/otel-prometheus-grafana.md](docs/otel-prometheus-grafana.md) | Live observability stack + how to build your own |
 | [Role README](ansible/collections/fiia/fleet/roles/agent/README.md) | Ansible install + variables |
 
-Local E2E over Docker (no VM): `make e2e` — full daemon → collector flow with
-drift assertions; `make e2e-ansible` — the same drift story driven entirely by
-Ansible against a throwaway container; `make e2e-systemd` — the agent role +
-service drift against a real systemd container; `make e2e-live` — daemon →
-collector → Prometheus → Grafana with a live dashboard and alert rules (tear
-down with `make e2e-live-down`). See [docs/development.md](docs/development.md).
+## Local E2E testing
+
+* `make e2e` start a set of containers with otel and a test environment
+* `make e2e-ansible` driven entirely by Ansible against a throwaway container; 
+* `make e2e-systemd` the agent role + service drift against a real systemd container; 
+* `make e2e-live`  daemon to collector to Prometheus to  Grafana with a live dashboard and alert rules (tear
+down with `make e2e-live-down`).
+
+See [docs/development.md](docs/development.md).
