@@ -1,85 +1,27 @@
 ---
-# Fiia dev bootstrap — targets a Lima VM, Colima VM, or localhost (Linux).
-# Run via: make dev-deploy
+# Fiia dev bootstrap: installs the agent on a Lima VM, Colima VM, or localhost
+# (Linux). Run via: make dev-deploy
 #
-# Installs fiia-agent as a systemd service, writes a sentinel+motd baseline,
-# records it with the agent binary (-write-manifest), and verifies with -check.
-# No hub, no secrets, no certificates. Drift verdicts go to OTel (stdout
-# by default; set fiia_otlp_endpoint to ship to a collector).
-#
-# Variables that can be overridden on the command line (-e):
-#   fiia_agent_binary - path to cross-compiled linux binary
-#   fiia_node_id      - node ID for the report
+# Override with -e: fiia_agent_binary (path to the linux binary),
+# fiia_otlp_endpoint (OTLP/HTTP receiver; omit for stdout export).
 
 - name: Bootstrap fiia agent on dev node
   hosts: fleet
   become: true
   vars:
-    fiia_install_dir: /usr/local/bin
-    fiia_config_dir: /etc/fiia
-    fiia_log_dir: /var/log/fiia
-    fiia_user: fiia
     fiia_heartbeat_interval_sec: 30
     fiia_audit_interval_sec: 120
     fiia_audit_jitter_max_sec: 10
-    fiia_node_id: "dev-node"
-    fiia_agent_binary: "fiia-agent-linux-arm64"
-    fiia_otlp_endpoint: ""
+    fiia_manifest_files:
+      - /etc/fiia/sentinel
+      - /etc/motd
 
   tasks:
-    - name: Create fiia system user (no login shell, no sudo)
-      ansible.builtin.user:
-        name: "{{ fiia_user }}"
-        system: true
-        shell: /usr/sbin/nologin
-        create_home: false
-        state: present
-
-    - name: Create config and log directories
+    - name: Create config directory
       ansible.builtin.file:
-        path: "{{ item.path }}"
+        path: /etc/fiia
         state: directory
-        owner: "{{ item.owner }}"
-        group: root
-        mode: "{{ item.mode }}"
-      loop:
-        - { path: "{{ fiia_config_dir }}", owner: root, mode: "0755" }
-        - { path: "{{ fiia_log_dir }}", owner: "{{ fiia_user }}", mode: "0750" }
-
-    - name: Write agent configuration
-      ansible.builtin.template:
-        src: files/agent.toml.j2
-        dest: "{{ fiia_config_dir }}/agent.toml"
-        owner: "{{ fiia_user }}"
-        group: root
-        mode: "0400"
-      vars:
-        inventory_hostname: "{{ fiia_node_id }}"
-
-    - name: Install fiia-agent binary
-      ansible.builtin.copy:
-        src: "{{ fiia_agent_binary }}"
-        dest: "{{ fiia_install_dir }}/fiia-agent"
-        owner: root
-        group: root
         mode: "0755"
-
-    - name: Install systemd unit
-      ansible.builtin.template:
-        src: files/fiia-agent.service.j2
-        dest: /etc/systemd/system/fiia-agent.service
-        owner: root
-        group: root
-        mode: "0644"
-      notify: Reload systemd
-
-    - name: Install logrotate config
-      ansible.builtin.copy:
-        src: files/fiia-logrotate
-        dest: /etc/logrotate.d/fiia
-        owner: root
-        group: root
-        mode: "0644"
 
     - name: Write dev baseline files
       ansible.builtin.copy:
@@ -97,44 +39,6 @@
         - dest: /etc/motd
           content: "Authorized access only. Activity is monitored by Fiia.\n"
 
-    - name: Record dev baseline manifest (last provisioning step)
-      ansible.builtin.command:
-        argv:
-          - "{{ fiia_install_dir }}/fiia-agent"
-          - -write-manifest
-          - -manifest
-          - "{{ fiia_config_dir }}/manifest.json"
-          - -files
-          - /etc/fiia/sentinel,/etc/motd
-      register: fiia_record
-      changed_when: "'wrote ' in fiia_record.stdout"
-
-    - name: Make manifest readable by the fiia service account (still 0400)
-      ansible.builtin.file:
-        path: "{{ fiia_config_dir }}/manifest.json"
-        owner: "{{ fiia_user }}"
-        group: root
-        mode: "0400"
-
-    - name: Enable and start fiia-agent
-      ansible.builtin.systemd:
-        name: fiia-agent
-        enabled: true
-        state: restarted
-        daemon_reload: true
-
-    - name: Verify baseline reads clean
-      ansible.builtin.command:
-        argv:
-          - "{{ fiia_install_dir }}/fiia-agent"
-          - -check
-          - -manifest
-          - "{{ fiia_config_dir }}/manifest.json"
-      register: fiia_check
-      changed_when: false
-      failed_when: fiia_check.rc != 0
-
-  handlers:
-    - name: Reload systemd
-      ansible.builtin.systemd:
-        daemon_reload: true
+    - name: Install and start fiia-agent
+      ansible.builtin.include_role:
+        name: fiia.fleet.agent

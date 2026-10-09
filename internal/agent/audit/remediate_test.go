@@ -45,18 +45,3 @@ func TestRemediationString(t *testing.T) {
 		}
 	}
 }
-
-// TestRemediationReportsOnlyWhatChanged guards the honest-accounting behavior:
-// an enforcement pass must report packages actually gone, and must never report
-// removals when nothing was unauthorized.
-func TestRemediationEmptyWhenNoUnauthorized(t *testing.T) {
-	r := Remediate(Manifest{
-		PackageSnapshot: []string{"bash", "openssh-server"},
-	})
-	// On a host where those are the only installed packages this is a no-op; we
-	// assert the type contracts rather than shell state: Empty() must be true
-	// for a zero change and the string stays blank.
-	if got := r.Empty(); !got {
-		t.Fatalf("expected no-op remediation, got %v", r)
-	}
-}

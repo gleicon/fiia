@@ -25,6 +25,8 @@ type AgentConfig struct {
 	AuditJitterMaxSec    int
 	OTLPEndpoint         string
 	Remediate            bool
+	CheckSet             []string
+	FastScan             bool
 }
 
 type agentTOML struct {
@@ -32,13 +34,15 @@ type agentTOML struct {
 }
 
 type agentSection struct {
-	NodeID               string `toml:"node_id"`
-	ManifestPath         string `toml:"manifest_path"`
-	HeartbeatIntervalSec int    `toml:"heartbeat_interval_sec"`
-	AuditIntervalSec     int    `toml:"audit_interval_sec"`
-	AuditJitterMaxSec    int    `toml:"audit_jitter_max_sec"`
-	OTLPEndpoint         string `toml:"otlp_endpoint"`
-	Remediate            bool   `toml:"remediate"`
+	NodeID               string   `toml:"node_id"`
+	ManifestPath         string   `toml:"manifest_path"`
+	HeartbeatIntervalSec int      `toml:"heartbeat_interval_sec"`
+	AuditIntervalSec     int      `toml:"audit_interval_sec"`
+	AuditJitterMaxSec    int      `toml:"audit_jitter_max_sec"`
+	OTLPEndpoint         string   `toml:"otlp_endpoint"`
+	Remediate            bool     `toml:"remediate"`
+	CheckSet             []string `toml:"check"`
+	FastScan             bool     `toml:"fast_scan"`
 }
 
 // Load reads the agent TOML configuration file at path.
@@ -68,6 +72,8 @@ func Load(path string) (*AgentConfig, error) {
 		AuditJitterMaxSec:    audit_jitter_max_sec_default,
 		OTLPEndpoint:         raw.Agent.OTLPEndpoint,
 		Remediate:            raw.Agent.Remediate,
+		CheckSet:             raw.Agent.CheckSet,
+		FastScan:             raw.Agent.FastScan,
 	}
 
 	if raw.Agent.HeartbeatIntervalSec > 0 {

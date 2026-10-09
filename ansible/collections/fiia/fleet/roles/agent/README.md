@@ -5,12 +5,10 @@ manifest as the last step (via the agent binary `-write-manifest`), and
 verifies the baseline reads clean.
 No hub, no secrets, no certificates.
 
-> **Golden rule — document what you want checked.** Fiia only checks what the
-> manifest records. Snapshot mode captures all packages + services
-> automatically, but **files are never snapshotted**: a file is tracked only if
-> you list it in the `manifest` module (`fiia_manifest_files`) or a
-> `-scan-playbook` run derives it from `copy:`/`template:`/`lineinfile:` tasks.
-> If it matters, promise it — otherwise changes to it are invisible.
+> **Golden rule:** fiia checks only what the manifest documents. Packages and
+> services are snapshotted automatically; files are never snapshotted, so list
+> each file in `fiia_manifest_files` or let `-scan-playbook` derive it. If it
+> matters, promise it.
 
 ## Install
 
@@ -35,7 +33,7 @@ collections_path = ./collections
 ## Usage
 
 ```yaml
-# site.yml — your existing provisioning playbook
+# site.yml, your existing provisioning playbook
 - name: Provision web servers
   hosts: webservers
   become: true
@@ -73,7 +71,7 @@ collections_path = ./collections
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `fiia_agent_binary` | — (required) | Local path to `fiia-agent` binary to deploy |
+| `fiia_agent_binary` | required | Local path to `fiia-agent` binary to deploy |
 | `fiia_otlp_endpoint` | unset (stdout) | OTLP/HTTP receiver for verdicts + liveness |
 | `fiia_manifest_path` | `/etc/fiia/manifest.json` | Where the manifest is recorded |
 | `fiia_manage_manifest` | `true` | Record + verify the manifest in the role (disable when your own tasks do it) |

@@ -102,6 +102,26 @@ docker exec "$CTR" /usr/local/bin/fiia-agent -check -manifest /etc/fiia/scan-man
   | grep -q "OK" && echo "PASS: scan→manifest→check reports clean"
 
 echo ""
+echo "=== stage 1c: record interception (before/after diff = ansible inventory) ==="
+docker exec -i "$CTR" bash -e << 'EOF'
+set -e
+rm -rf /tmp/rec && mkdir -p /tmp/rec/conf
+printf 'a=1\n' > /tmp/rec/conf/a.conf
+printf 'c=1\n' > /tmp/rec/conf/c.conf
+fiia-agent -record-begin -data /tmp/rec/pre.json -dirs /tmp/rec/conf \
+  | grep -q "recorded 2 files"
+printf 'a=2\n' > /tmp/rec/conf/a.conf     # changed
+printf 'b=3\n' > /tmp/rec/conf/b.conf     # added
+rm /tmp/rec/conf/c.conf                   # deleted
+fiia-agent -record-end -manifest /tmp/rec/manifest.json -data /tmp/rec/pre.json -dirs /tmp/rec/conf \
+  | grep -q "files added=2 removed=1"
+fiia-agent -check -manifest /tmp/rec/manifest.json | grep -q "OK: no drift"
+printf 'tampered\n' > /tmp/rec/conf/a.conf
+fiia-agent -check -manifest /tmp/rec/manifest.json | grep -q "DRIFT"
+echo "PASS: record-begin/end derive the ansible inventory and detect drift"
+EOF
+
+echo ""
 echo "=== stage 2: introduce drift, verify detection, restore ==="
 ansible-playbook "${ANSIBLE_ARGS[@]}" "$E2E_DIR/drift.yml"
 

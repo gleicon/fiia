@@ -28,46 +28,62 @@ var errNoPackageManager = fmt.Errorf("no package manager found")
 // authorized it (-remediate / remediate=true).
 func Remediate(m Manifest) Remediation {
 	var rem Remediation
+	rem.PackagesRemoved = remediatePackages(m.PackageSnapshot)
+	remediateServices(&rem, m.ServiceSnapshot, m.Services)
+	return rem
+}
 
-	if len(m.PackageSnapshot) > 0 {
-		current, err := listInstalledPackages()
-		if err == nil {
-			unauthorized := unauthorizedSet(m.PackageSnapshot, current)
-			if len(unauthorized) > 0 {
-				if hasBin("apt-get") {
-					// Remove the whole set in one invocation so apt resolves the
-					// dependency graph (curl's deep deps depend on each other and
-					// a per-package loop leaves orphans behind).
-					args := append([]string{"remove", "-y", "--purge"}, unauthorized...)
-					exec.Command("apt-get", args...).Run()
-					exec.Command("apt-get", "autoremove", "-y", "--purge").Run()
-				} else {
-					for _, p := range unauthorized {
-						removePackage(p)
-					}
-				}
-				// Reconcile against the actual post-run state so the report is
-				// honest: only record packages apt actually removed (it may keep
-				// protected/essential ones).
-				if after, err := listInstalledPackages(); err == nil {
-					still := make(map[string]bool, len(after))
-					for _, p := range after {
-						still[p] = true
-					}
-					for _, p := range unauthorized {
-						if !still[p] {
-							rem.PackagesRemoved = append(rem.PackagesRemoved, p)
-						}
-					}
-				}
-			}
+// remediatePackages removes every installed package not in the snapshot. One
+// apt-get invocation removes the whole set so apt resolves the dependency
+// graph (curl's deep deps depend on each other and a per-package loop leaves
+// orphans behind), then autoremove clears the leftovers. The report is
+// reconciled against the post-run state so only packages actually removed are
+// recorded (apt may keep protected/essential ones).
+func remediatePackages(snapshot []string) []string {
+	if len(snapshot) == 0 {
+		return nil
+	}
+	current, err := listInstalledPackages()
+	if err != nil {
+		return nil
+	}
+	unauthorized := unauthorizedSet(snapshot, current)
+	if len(unauthorized) == 0 {
+		return nil
+	}
+	if hasBin("apt-get") {
+		args := append([]string{"remove", "-y", "--purge"}, unauthorized...)
+		exec.Command("apt-get", args...).Run()
+		exec.Command("apt-get", "autoremove", "-y", "--purge").Run()
+	} else {
+		for _, p := range unauthorized {
+			removePackage(p)
 		}
 	}
+	after, err := listInstalledPackages()
+	if err != nil {
+		return nil
+	}
+	still := make(map[string]struct{}, len(after))
+	for _, p := range after {
+		still[p] = struct{}{}
+	}
+	var removed []string
+	for _, p := range unauthorized {
+		if _, ok := still[p]; !ok {
+			removed = append(removed, p)
+		}
+	}
+	return removed
+}
 
-	if len(m.ServiceSnapshot) > 0 {
+// remediateServices stops/disables services not in the service snapshot and
+// brings declared services back to their recorded running/enabled state.
+func remediateServices(rem *Remediation, serviceSnapshot []string, declared []ManifestService) {
+	if len(serviceSnapshot) > 0 {
 		current, err := listActiveServices()
 		if err == nil {
-			for _, s := range unauthorizedSet(m.ServiceSnapshot, current) {
+			for _, s := range unauthorizedSet(serviceSnapshot, current) {
 				stopService(s)
 				disableService(s)
 				rem.ServicesStopped = append(rem.ServicesStopped, s)
@@ -75,7 +91,7 @@ func Remediate(m Manifest) Remediation {
 		}
 	}
 
-	for _, s := range m.Services {
+	for _, s := range declared {
 		if s.Running {
 			if err := exec.Command("systemctl", "--system", "is-active", "--quiet", s.Name).Run(); err != nil {
 				if startService(s.Name) == nil {
@@ -101,8 +117,6 @@ func Remediate(m Manifest) Remediation {
 			}
 		}
 	}
-
-	return rem
 }
 
 func removePackage(name string) error {

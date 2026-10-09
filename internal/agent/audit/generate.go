@@ -45,50 +45,9 @@ func GenerateManifest(dest string, files []string, pkgs []PackageSpec, svcs []st
 		GeneratedAt:   time.Now().Unix(),
 	}
 
-	for _, path := range files {
-		info, stat_err := os.Stat(path)
-		if stat_err != nil || !info.Mode().IsRegular() {
-			warnings = append(warnings, fmt.Sprintf("file not found at provisioning time: %s", path))
-			continue
-		}
-		sum, sum_err := sha256File(path)
-		if sum_err != nil {
-			warnings = append(warnings, fmt.Sprintf("file unreadable at provisioning time: %s", path))
-			continue
-		}
-		m.Files = append(m.Files, ManifestFile{
-			Path:   path,
-			SHA256: sum,
-			Mode:   fmt.Sprintf("%o", info.Mode().Perm()),
-		})
-	}
-
-	for _, p := range pkgs {
-		installed, ok := LookupPackageVersion(p.Name)
-		if !ok {
-			warnings = append(warnings, fmt.Sprintf("package not installed at provisioning time: %s", p.Name))
-		}
-		entry := ManifestPackage{Name: p.Name}
-		if v := firstNonEmpty(p.Version, installed); v != "" {
-			entry.Version = v
-		}
-		m.Packages = append(m.Packages, entry)
-	}
-
-	for _, name := range svcs {
-		running, enabled := QueryServiceStates(name)
-		m.Services = append(m.Services, ManifestService{
-			Name:    name,
-			Running: running,
-			Enabled: enabled,
-		})
-		if !running {
-			warnings = append(warnings, fmt.Sprintf("service not active at provisioning time: %s", name))
-		}
-		if !enabled {
-			warnings = append(warnings, fmt.Sprintf("service not enabled at provisioning time: %s", name))
-		}
-	}
+	warnings = append(warnings, collectFiles(files, &m)...)
+	warnings = append(warnings, collectPackages(pkgs, &m)...)
+	warnings = append(warnings, collectServices(svcs, &m)...)
 
 	if snapshot {
 		m.PackageSnapshot = ListInstalledPackages()
@@ -104,26 +63,99 @@ func GenerateManifest(dest string, files []string, pkgs []PackageSpec, svcs []st
 		changed = !manifestsEqual(existing, m)
 	}
 
+	if err := writeManifest(dest, m); err != nil {
+		return warnings, changed, err
+	}
+	return warnings, changed, nil
+}
+
+// writeManifest writes the manifest atomically, owner-only readable.
+func writeManifest(dest string, m Manifest) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
-		return warnings, changed, fmt.Errorf("encode manifest: %w", err)
+		return fmt.Errorf("encode manifest: %w", err)
 	}
 	if dir := filepath.Dir(dest); dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
-			return warnings, changed, fmt.Errorf("create manifest dir: %w", err)
+			return fmt.Errorf("create manifest dir: %w", err)
 		}
 	}
 	tmp := dest + ".tmp"
 	if err := os.WriteFile(tmp, data, 0400); err != nil {
-		return warnings, changed, fmt.Errorf("write manifest tmp: %w", err)
+		return fmt.Errorf("write manifest tmp: %w", err)
 	}
 	if err := os.Rename(tmp, dest); err != nil {
-		return warnings, changed, fmt.Errorf("install manifest: %w", err)
+		return fmt.Errorf("install manifest: %w", err)
 	}
 	if err := os.Chmod(dest, 0400); err != nil {
-		return warnings, changed, fmt.Errorf("chmod manifest: %w", err)
+		return fmt.Errorf("chmod manifest: %w", err)
 	}
-	return warnings, changed, nil
+	return nil
+}
+
+// collectFiles hashes each declared file into the manifest, warning on any
+// file that is missing or unreadable at provisioning time.
+func collectFiles(files []string, m *Manifest) []string {
+	var warnings []string
+	for _, path := range files {
+		info, stat_err := os.Stat(path)
+		if stat_err != nil || !info.Mode().IsRegular() {
+			warnings = append(warnings, fmt.Sprintf("file not found at provisioning time: %s", path))
+			continue
+		}
+		sum, sum_err := sha256File(path)
+		if sum_err != nil {
+			warnings = append(warnings, fmt.Sprintf("file unreadable at provisioning time: %s", path))
+			continue
+		}
+		m.Files = append(m.Files, ManifestFile{
+			Path:   path,
+			SHA256: sum,
+			Mode:   fmt.Sprintf("%o", info.Mode().Perm()),
+			Size:   info.Size(),
+			MTime:  info.ModTime().Unix(),
+		})
+	}
+	return warnings
+}
+
+// collectPackages records each declared package (installed version, or a
+// pinned version), warning on packages not installed at provisioning time.
+func collectPackages(pkgs []PackageSpec, m *Manifest) []string {
+	var warnings []string
+	for _, p := range pkgs {
+		installed, ok := LookupPackageVersion(p.Name)
+		if !ok {
+			warnings = append(warnings, fmt.Sprintf("package not installed at provisioning time: %s", p.Name))
+		}
+		entry := ManifestPackage{Name: p.Name}
+		if v := firstNonEmpty(p.Version, installed); v != "" {
+			entry.Version = v
+		}
+		m.Packages = append(m.Packages, entry)
+	}
+	return warnings
+}
+
+// collectServices records each declared service's actual state, warning when a
+// service is not active or not enabled at provisioning time.
+func collectServices(svcs []string, m *Manifest) []string {
+	var warnings []string
+	for _, name := range svcs {
+		running, enabled := QueryServiceStates(name)
+		m.Services = append(m.Services, ManifestService{
+			Name:    name,
+			Running: running,
+			Enabled: enabled,
+		})
+		if !running {
+			warnings = append(warnings, fmt.Sprintf("service not active at provisioning time: %s", name))
+		}
+		if !enabled {
+			warnings = append(warnings, fmt.Sprintf("service not enabled at provisioning time: %s", name))
+		}
+	}
+	return warnings
 }
 
 func firstNonEmpty(vals ...string) string {

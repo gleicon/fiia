@@ -87,7 +87,6 @@ ANSIBLE_PLAYBOOK ?= $(if $(ANSIBLE_DIRECT),$(ANSIBLE_BIN),\
                     $(if $(and $(ANSIBLE_BIN),$(ANSIBLE_PYTHON)),$(ANSIBLE_PYTHON) $(ANSIBLE_BIN),))
 
 LINUX_BINARY := fiia-agent-linux-$(LINUX_GOARCH)
-DEV_NODE_ID  := $(shell $(VM) node-id 2>/dev/null || echo dev-node)
 
 # ── dev setup ──────────────────────────────────────────────────────────────────
 # dev-init: one-shot first-time setup (detect backend, create VM, start it)
@@ -159,8 +158,7 @@ dev-deploy: dev-build dev-inventory
 	$(ANSIBLE_PLAYBOOK) \
 	  -i deploy/ansible/inventory/dev.ini \
 	  -e "fiia_agent_binary=$(CURDIR)/$(LINUX_BINARY)" \
-	  -e "fiia_node_id=$(DEV_NODE_ID)" \
-	  deploy/ansible/dev-bootstrap.yml
+		  deploy/ansible/dev-bootstrap.yml
 
 # ── dev observe ────────────────────────────────────────────────────────────────
 

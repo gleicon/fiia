@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	agentcfg "github.com/gleicon/fiia/internal/agent/config"
@@ -129,8 +131,8 @@ type ManifestFile struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 	Mode   string `json:"mode,omitempty"`
-	Owner  string `json:"owner,omitempty"`
-	Group  string `json:"group,omitempty"`
+	Size   int64  `json:"size,omitempty"`  // bytes at record time
+	MTime  int64  `json:"mtime,omitempty"` // unix seconds at record time
 }
 
 // ManifestPackage is one package entry in the manifest.
@@ -185,8 +187,13 @@ func RunManifest(cfg *agentcfg.AgentConfig) (CheckResult, bool) {
 
 	result.ManifestGeneratedAt = m.GeneratedAt
 
+	checks := cfg.CheckSet
+	if len(checks) == 0 {
+		checks = DefaultCheckSet()
+	}
+
 	var deviations []string
-	deviations = append(deviations, checkFiles(m.Files)...)
+	deviations = append(deviations, checkFiles(m.Files, checks, cfg.FastScan)...)
 	deviations = append(deviations, checkPackages(m.Packages)...)
 	deviations = append(deviations, checkServices(m.Services)...)
 	deviations = append(deviations, checkUnauthorizedPackages(m.PackageSnapshot)...)
@@ -230,17 +237,62 @@ func loadManifest(path string) (Manifest, error) {
 	return m, nil
 }
 
-func checkFiles(files []ManifestFile) []string {
+// checkFiles verifies every tracked file, hashing on a fixed bounded worker
+// pool. Result order matches the manifest.
+func checkFiles(files []ManifestFile, checks []string, fast bool) []string {
+	type job struct {
+		idx int
+		f   ManifestFile
+	}
+	jobs := make(chan job)
+	results := make([]error, len(files))
+
+	var wg sync.WaitGroup
+	for i := 0; i < boundedWorkers(len(files)); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				results[j.idx] = checkFile(j.f, checks, fast)
+			}
+		}()
+	}
+	for i := range files {
+		jobs <- job{i, files[i]}
+	}
+	close(jobs)
+	wg.Wait()
+
 	var deviations []string
-	for _, f := range files {
-		if err := checkFile(f); err != nil {
-			deviations = append(deviations, fmt.Sprintf("file:%s:%s", err.Error(), f.Path))
+	for i := range results {
+		if results[i] != nil {
+			deviations = append(deviations, fmt.Sprintf("file:%s:%s", results[i].Error(), files[i].Path))
 		}
 	}
 	return deviations
 }
 
-func checkFile(f ManifestFile) error {
+// boundedWorkers caps the parallel hashing pool at the number of CPUs, clamped
+// to the number of items (and at least one).
+func boundedWorkers(items int) int {
+	w := runtime.GOMAXPROCS(0)
+	if w < 1 {
+		w = 1
+	}
+	if items < w {
+		w = items
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+// checkFile verifies a tracked file. sha256 is always compared unless the
+// record trusts stat: with fast=true, a matching size and mtime short-circuit
+// the hash entirely. mode, size, and mtime are compared only when enabled in
+// the check set.
+func checkFile(f ManifestFile, checks []string, fast bool) error {
 	assert.True(f.Path != "", "file path must not be empty")
 	assert.True(f.SHA256 != "", "file sha256 must not be empty")
 
@@ -255,6 +307,18 @@ func checkFile(f ManifestFile) error {
 		return fmt.Errorf("is_directory")
 	}
 
+	if checkEnabled(checks, "mode") && f.Mode != "" {
+		actual := fmt.Sprintf("%o", info.Mode().Perm())
+		if actual != f.Mode {
+			return fmt.Errorf("mode_mismatch")
+		}
+	}
+
+	if fast && f.Size != 0 && f.MTime != 0 &&
+		info.Size() == f.Size && info.ModTime().Unix() == f.MTime {
+		return nil // unchanged by size+mtime; skip the hash
+	}
+
 	got, err := sha256File(f.Path)
 	if err != nil {
 		return fmt.Errorf("unreadable")
@@ -263,14 +327,28 @@ func checkFile(f ManifestFile) error {
 		return fmt.Errorf("hash_mismatch")
 	}
 
-	if f.Mode != "" {
-		actual := fmt.Sprintf("%o", info.Mode().Perm())
-		if actual != f.Mode {
-			return fmt.Errorf("mode_mismatch")
-		}
+	if checkEnabled(checks, "size") && f.Size != 0 && info.Size() != f.Size {
+		return fmt.Errorf("size_mismatch")
+	}
+	if checkEnabled(checks, "mtime") && f.MTime != 0 && info.ModTime().Unix() != f.MTime {
+		return fmt.Errorf("mtime_mismatch")
 	}
 
 	return nil
+}
+
+// DefaultCheckSet is the set of file attributes compared when the config does
+// not specify one.
+func DefaultCheckSet() []string { return []string{"sha256", "mode"} }
+
+// checkEnabled reports whether name is in the check set.
+func checkEnabled(checks []string, name string) bool {
+	for _, c := range checks {
+		if c == name {
+			return true
+		}
+	}
+	return false
 }
 
 func sha256File(path string) (string, error) {
@@ -283,8 +361,28 @@ func sha256File(path string) (string, error) {
 	defer fh.Close()
 
 	h := sha256.New()
-	if _, err := io.Copy(h, fh); err != nil {
-		return "", err
+	// Read manually against the pooled buffer: io.CopyBuffer would dispatch to
+	// os.File.WriteTo, which allocates its own 32KiB buffer per file.
+	buf := hashBufPool.Get().(*[]byte)
+	defer hashBufPool.Put(buf)
+	for {
+		n, err := fh.Read(*buf)
+		if n > 0 {
+			h.Write((*buf)[:n])
+		}
+		if err != nil {
+			if err == io.EOF {
+				return fmt.Sprintf("%x", h.Sum(nil)), nil
+			}
+			return "", err
+		}
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+// hashBufPool holds the read buffer reused across hashed files.
+var hashBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
 }

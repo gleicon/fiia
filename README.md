@@ -1,93 +1,51 @@
-# Fiia — Configuration Drift Detection for Ansible-Managed Servers
+# Fiia
 
-After provisioning with Ansible, Fiia checks that servers still match what you
-provisioned (files, packages, services) and reports to your OpenTelemetry
-pipeline.
+Configuration drift detection for Ansible-managed servers. `fiia-agent` records
+what a playbook provisions (files, packages, services) in a manifest and checks
+the node against it on an interval, reporting verdicts and liveness over
+OpenTelemetry. No hub, no secrets.
 
 ## Quick start
 
 ```sh
-# 1. Record the baseline after provisioning.
+# record the baseline after provisioning
 fiia-agent -write-manifest -manifest /etc/fiia/manifest.json \
-  -files /etc/nginx/nginx.conf,/etc/ssh/sshd_config \
-  -packages nginx,openssh-server \
-  -services nginx,ssh -snapshot
+  -files /etc/nginx/nginx.conf -packages nginx -services nginx -snapshot
 
-# 2. Check for drift any time.
-fiia-agent -check -manifest /etc/fiia/manifest.json
-# OK: no drift (files=2 packages=2 services=2)   → exit 0
-# DRIFT: 1 deviation(s)                          → exit 1
+# check for drift
+fiia-agent -check -manifest /etc/fiia/manifest.json   # exit 0 clean, 1 drift, 2 error
 ```
 
-Have playbooks? Derive the file list from them instead of writing it by hand:
-
-```sh
-fiia-agent -write-manifest -manifest /etc/fiia/manifest.json \
-  -scan-playbook site.yml -packages nginx -services nginx -snapshot
-```
-
-Last task in your play works too (runs over plain SSH, no daemon — the agent
-binary is the manifest generator, invoked directly by Ansible):
+Run the record step as the last task in your play. The `fiia.fleet.agent` role
+does this via its `fiia_manifest_*` variables; directly it looks like:
 
 ```yaml
 - name: Update fiia drift manifest
   ansible.builtin.command:
-    argv: ["/usr/local/bin/fiia-agent", -write-manifest,
-           -manifest, /etc/fiia/manifest.json,
-           -files, /etc/nginx/nginx.conf,/etc/ssh/sshd_config,
-           -packages, nginx,openssh-server,
-           -services, nginx,ssh, -snapshot]
+    argv: [fiia-agent, -write-manifest, -manifest, /etc/fiia/manifest.json,
+           -files, /etc/nginx/nginx.conf,/etc/ssh/sshd_config, -snapshot]
 ```
 
-The `fiia.fleet.agent` role does this for you via its `fiia_manifest_*`
-variables (files, packages, services, snapshot) as the last provisioning step.
+Golden rule: fiia checks only what the manifest documents. Packages and
+services are snapshotted automatically; files are never snapshotted, so
+document every file you want checked. If it matters, promise it.
 
-## How it runs
-
-> **Golden rule: fiia only checks what the manifest documents.** The manifest is
-> a curated promise, not an audit log or a full OS snapshot. Packages and
-> services are snapshotted automatically (snapshot mode) so additions are
-> caught; **files are never snapshotted** — a file is checked only if you
-> document it in Ansible (`copy:`/`template:`/`lineinfile:`, picked up by
-> `-scan-playbook`) or list it directly in the manifest. *If it matters, promise
-> it.*
-
-| Mode | Command | Use |
-|------|---------|-----|
-| Daemon | `fiia-agent -config /etc/fiia/agent.toml` | systemd: heartbeats + checks to OTel |
-| One-shot | `fiia-agent -check …` | cron, CI, `ansible -m command`, by hand |
-| Generate | `fiia-agent -write-manifest …` | record baseline after provisioning |
-| Scan | `fiia-agent -scan-playbook …` | list what a playbook manages |
-
-Every check emits to OTel (stdout JSON by default, OTLP/HTTP when configured):
-`fiia.alive` (alert on missing series = silent node), `fiia.drift.status`
-(0 clean / 1 drift / 2 error), `fiia.drift.details` (while drifting, carries
-the deviations as labels), `fiia.checks.total`, plus a log record per check.
-Exit codes for `-check`: 0 / 1 / 2.
-
-```toml
-# /etc/fiia/agent.toml — manifest_path is the only required field
-[agent]
-manifest_path = "/etc/fiia/manifest.json"
-# node_id, heartbeat_interval_sec, audit_interval_sec, otlp_endpoint …
-```
+The agent runs as a systemd daemon (`-config /etc/fiia/agent.toml`, only
+`manifest_path` required) or one-shot (`-check`). Each check emits
+`fiia.alive`, `fiia.drift.status` (0/1/2), `fiia.drift.details`, and
+`fiia.checks.total` to stdout or OTLP/HTTP, plus a log record of the
+deviations.
 
 ## Docs
 
 | | |
 |-|-|
-| [docs/development.md](docs/development.md) | Flags, OTel signals, dev loop, config, E2E |
-| [docs/drift-operations.md](docs/drift-operations.md) | Find/fix drift, fleet queries, remediation & promises |
-| [docs/architecture.md](docs/architecture.md) | Components, data flows, rules |
-| [docs/otel-prometheus-grafana.md](docs/otel-prometheus-grafana.md) | Live observability stack + how to build your own |
-| [Role README](ansible/collections/fiia/fleet/roles/agent/README.md) | Ansible install + variables |
+| [docs/development.md](docs/development.md) | Flags, config, OTel signals, E2E |
+| [docs/ansible-interception.md](docs/ansible-interception.md) | Adopt fiia with existing cookbooks; record what Ansible changes |
+| [docs/drift-operations.md](docs/drift-operations.md) | Find/fix drift, fleet queries, remediation |
+| [docs/architecture.md](docs/architecture.md) | Components and data flows |
+| [docs/otel-prometheus-grafana.md](docs/otel-prometheus-grafana.md) | Live observability stack and how to build your own |
+| [Role README](ansible/collections/fiia/fleet/roles/agent/README.md) | Ansible install and variables |
 
-## Local E2E testing
-
-* `make e2e` start a set of containers with otel and a test environment
-* `make e2e-ansible` driven entirely by Ansible against a throwaway container; 
-* `make e2e-systemd` the agent role + service drift against a real systemd container; 
-* `make e2e-live`  daemon to collector to Prometheus to  Grafana with a live dashboard and alert rules (tear
-down with `make e2e-live-down`).
-
-See [docs/development.md](docs/development.md).
+Local E2E over Docker: `make e2e`, `make e2e-ansible`, `make e2e-systemd`,
+`make e2e-live` (tear down with `make e2e-live-down`).

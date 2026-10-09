@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/gleicon/fiia/internal/assert"
@@ -41,7 +40,7 @@ func ScanPlaybooks(paths []string) (files []string, warnings []string, err error
 			return nil, nil, err
 		}
 	}
-	return dedupe(files), dedupe(warnings), nil
+	return Dedupe(files), Dedupe(warnings), nil
 }
 
 type scanner struct {
@@ -423,15 +422,16 @@ func displayName(task map[string]any) string {
 	return "unnamed"
 }
 
-func dedupe(in []string) []string {
-	seen := map[string]bool{}
+// Dedupe removes duplicates while preserving order. Shared by the scanner and
+// the CLI's file-list merge.
+func Dedupe(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
 	out := make([]string, 0, len(in))
 	for _, s := range in {
-		if !seen[s] {
-			seen[s] = true
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
 			out = append(out, s)
 		}
 	}
-	sort.Strings(out)
 	return out
 }

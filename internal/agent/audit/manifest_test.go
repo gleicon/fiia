@@ -11,7 +11,7 @@ import (
 	agentcfg "github.com/gleicon/fiia/internal/agent/config"
 )
 
-func writeManifest(t *testing.T, dir string, m Manifest) string {
+func writeTestManifest(t *testing.T, dir string, m Manifest) string {
 	t.Helper()
 	data, err := json.Marshal(m)
 	if err != nil {
@@ -70,7 +70,7 @@ func TestRunManifestCleanFile(t *testing.T) {
 			{Path: file_path, SHA256: sha256Hex(content), Mode: "644"},
 		},
 	}
-	cfg := cfgWithManifest(writeManifest(t, dir, m))
+	cfg := cfgWithManifest(writeTestManifest(t, dir, m))
 	p, ok := RunManifest(cfg)
 	if !ok {
 		t.Fatal("expected ok=true")
@@ -92,7 +92,7 @@ func TestRunManifestMissingFile(t *testing.T) {
 			{Path: filepath.Join(dir, "ghost.conf"), SHA256: sha256Hex([]byte("x")), Mode: "644"},
 		},
 	}
-	cfg := cfgWithManifest(writeManifest(t, dir, m))
+	cfg := cfgWithManifest(writeTestManifest(t, dir, m))
 	p, _ := RunManifest(cfg)
 	if p.Status != "DRIFT_DETECTED" {
 		t.Fatalf("status: got %q, want DRIFT_DETECTED", p.Status)
@@ -120,7 +120,7 @@ func TestRunManifestHashMismatch(t *testing.T) {
 			{Path: file_path, SHA256: sha256Hex([]byte("expected content")), Mode: "644"},
 		},
 	}
-	cfg := cfgWithManifest(writeManifest(t, dir, m))
+	cfg := cfgWithManifest(writeTestManifest(t, dir, m))
 	p, _ := RunManifest(cfg)
 	if p.Status != "DRIFT_DETECTED" {
 		t.Fatalf("status: got %q, want DRIFT_DETECTED", p.Status)
@@ -151,7 +151,7 @@ func TestRunManifestModeMismatch(t *testing.T) {
 			{Path: file_path, SHA256: sha256Hex(content), Mode: "644"}, // expects 644, got 600
 		},
 	}
-	cfg := cfgWithManifest(writeManifest(t, dir, m))
+	cfg := cfgWithManifest(writeTestManifest(t, dir, m))
 	p, _ := RunManifest(cfg)
 	if p.Status != "DRIFT_DETECTED" {
 		t.Fatalf("status: got %q, want DRIFT_DETECTED", p.Status)
@@ -201,7 +201,7 @@ func TestRunManifestMultipleDeviations(t *testing.T) {
 			{Path: file_path, SHA256: sha256Hex([]byte("wrong")), Mode: "644"},                      // hash mismatch
 		},
 	}
-	cfg := cfgWithManifest(writeManifest(t, dir, m))
+	cfg := cfgWithManifest(writeTestManifest(t, dir, m))
 	p, _ := RunManifest(cfg)
 	if p.Status != "DRIFT_DETECTED" {
 		t.Fatalf("status: got %q, want DRIFT_DETECTED", p.Status)
@@ -221,7 +221,7 @@ func TestProbeManifestEmptyPath(t *testing.T) {
 func TestProbeManifestValid(t *testing.T) {
 	dir := t.TempDir()
 	m := Manifest{SchemaVersion: 1, GeneratedAt: 1700000000}
-	cfg := cfgWithManifest(writeManifest(t, dir, m))
+	cfg := cfgWithManifest(writeTestManifest(t, dir, m))
 	if err := ProbeManifest(cfg); err != nil {
 		t.Errorf("ProbeManifest with valid manifest: %v", err)
 	}

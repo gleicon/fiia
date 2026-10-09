@@ -3,9 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand/v2"
 	"os"
 	"os/signal"
@@ -52,6 +53,10 @@ func main() {
 	scan_flag := flag.String("scan-playbook", "", "comma-separated playbook paths to scan for managed files (feeds -write-manifest, or prints the list alone)")
 	otlp_flag := flag.String("otlp-endpoint", "", "OTLP/HTTP endpoint (default: OTEL_EXPORTER_OTLP_ENDPOINT env, else stdout)")
 	remediate_flag := flag.Bool("remediate", false, "enforce the manifest (remove unauthorized packages/services, fix declared service states). WARNING: this covers ONLY the packages & services recorded in the manifest snapshot — it does NOT restore users, cron, firewall, sysctl, or any other state that Ansible/IaC manages. OFF by default; re-running the provisioning playbook is the only complete fix. Files are never auto-restored.")
+	record_begin := flag.Bool("record-begin", false, "record: index the file tree under -dirs into -data before a provisioning run")
+	record_end := flag.Bool("record-end", false, "record: diff -data against a fresh index and merge the changed files into -manifest (the ansible inventory)")
+	data_flag := flag.String("data", "", "record: index path (record-begin writes it, record-end reads it)")
+	dirs_flag := flag.String("dirs", "", "record: comma-separated root dirs to index")
 	flag.Parse()
 
 	if *check_mode && *write_manifest {
@@ -63,6 +68,16 @@ func main() {
 	}
 	if *write_manifest {
 		os.Exit(runWriteManifest(*manifest_flag, *files_flag, *packages_flag, *services_flag, *snapshot_flag, *scan_flag))
+	}
+	if *record_begin && *record_end {
+		fmt.Fprintln(os.Stderr, "agent: -record-begin and -record-end are mutually exclusive")
+		os.Exit(2)
+	}
+	if *record_begin {
+		os.Exit(runRecordBegin(*data_flag, *dirs_flag))
+	}
+	if *record_end {
+		os.Exit(runRecordEnd(*manifest_flag, *data_flag, *dirs_flag))
 	}
 	if *check_mode {
 		os.Exit(runCheck(*config_path, *manifest_flag, *format_flag, *node_flag, *otlp_flag, *remediate_flag))
@@ -85,15 +100,26 @@ func resolveNodeID(flag_val, cfg_val string) string {
 	return "localhost"
 }
 
+// fatal logs a startup error and exits. The agent runs under systemd, so
+// failures are visible through the service log.
+func fatal(msg string, err error) {
+	if err != nil {
+		slog.Error(msg, "err", err.Error())
+	} else {
+		slog.Error(msg)
+	}
+	os.Exit(1)
+}
+
 // runDaemon is the long-running mode: heartbeat liveness plus periodic
 // manifest checks, all emitted to OTel. Alerting happens downstream.
 func runDaemon(config_path, node_flag, otlp_flag string) int {
 	if config_path == "" {
-		log.Fatal("agent: -config path must not be empty")
+		fatal("agent: -config path must not be empty", nil)
 	}
 	cfg, err := agentcfg.Load(config_path)
 	if err != nil {
-		log.Fatalf("agent: load config %q: %v", config_path, err)
+		fatal(fmt.Sprintf("agent: load config %q", config_path), err)
 	}
 	cfg.NodeID = resolveNodeID(node_flag, cfg.NodeID)
 
@@ -102,21 +128,21 @@ func runDaemon(config_path, node_flag, otlp_flag string) int {
 
 	otel, shutdown, err := agentotel.Setup(ctx, otlpEndpoint(otlp_flag, cfg.OTLPEndpoint), cfg.NodeID)
 	if err != nil {
-		log.Fatalf("agent: otel setup: %v", err)
+		fatal("agent: otel setup", err)
 	}
 	defer func() {
 		shut_ctx, shut_cancel := context.WithTimeout(context.Background(), otel_shutdown_timeout)
 		defer shut_cancel()
 		if err := shutdown(shut_ctx); err != nil {
-			log.Printf("agent: otel shutdown: %v", err)
+			slog.Warn("agent: otel shutdown", "err", err.Error())
 		}
 	}()
 
 	sdnotify.Notify("READY=1")
-	log.Printf("agent: started (node_id=%s manifest=%s)", cfg.NodeID, cfg.ManifestPath)
+	slog.Info("agent: started", "node_id", cfg.NodeID, "manifest", cfg.ManifestPath)
 
 	if err := audit.ProbeManifest(cfg); err != nil {
-		log.Printf("agent: manifest probe failed — checks disabled: %v", err)
+		slog.Warn("agent: manifest probe failed, checks disabled", "err", err.Error())
 		// Emit periodic CHECK_ERROR verdicts so backends alert instead of
 		// seeing a silent node that never produces a drift verdict.
 		go runErrorLoop(ctx, cfg, otel, err)
@@ -129,7 +155,7 @@ func runDaemon(config_path, node_flag, otlp_flag string) int {
 	signal.Notify(sig_ch, syscall.SIGTERM, syscall.SIGINT)
 	sig := <-sig_ch
 
-	log.Printf("agent: received signal %s, shutting down", sig)
+	slog.Info("agent: received signal, shutting down", "signal", sig.String())
 	cancel()
 	return 0
 }
@@ -187,14 +213,14 @@ func runAuditLoop(ctx context.Context, cfg *agentcfg.AgentConfig, otel *agentote
 		// deviations remain the provisioning playbook's job (IaS).
 		if cfg.Remediate && result.Status == audit.StatusDriftDetected {
 			if rem, err := audit.RemediatePath(cfg.ManifestPath); err == nil && !rem.Empty() {
-				log.Printf("remediate: %s", rem.String())
+				slog.Info(fmt.Sprintf("remediate: %s", rem.String()))
 			}
 		}
 		otel.EmitCheck(ctx, result)
 		if result.Status == audit.StatusOK {
-			log.Printf("audit: clean")
+			slog.Info("audit: clean")
 		} else {
-			log.Printf("audit: %s deviations=%d", result.Status, len(result.Deviations))
+			slog.Info(fmt.Sprintf("audit: %s deviations=%d", result.Status, len(result.Deviations)))
 		}
 	}
 }
@@ -217,7 +243,7 @@ func runErrorLoop(ctx context.Context, cfg *agentcfg.AgentConfig, otel *agentote
 			Deviations:    []string{fmt.Sprintf("manifest:unreadable:%v%s", probeErr, hint)},
 		}
 		otel.EmitCheck(ctx, result)
-		log.Printf("audit: %s (%v)%s", result.Status, probeErr, hint)
+		slog.Info(fmt.Sprintf("audit: %s (%v)%s", result.Status, probeErr, hint))
 	}
 }
 
@@ -274,7 +300,7 @@ func runWriteManifest(dest, files_flag, packages_flag, services_flag string, sna
 		for _, w := range warnings {
 			fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 		}
-		files = dedupe(append(files, scanned...))
+		files = audit.Dedupe(append(files, scanned...))
 	}
 
 	var pkgs []audit.PackageSpec
@@ -303,6 +329,40 @@ func runWriteManifest(dest, files_flag, packages_flag, services_flag string, sna
 	return 0
 }
 
+// runRecordBegin saves a file index of the roots before a provisioning run.
+func runRecordBegin(data_flag, dirs_flag string) int {
+	roots := splitCSV(dirs_flag)
+	if data_flag == "" || len(roots) == 0 {
+		fmt.Fprintln(os.Stderr, "agent: -record-begin needs -data <index> and -dirs <roots>")
+		return 2
+	}
+	n, err := audit.RecordBegin(data_flag, roots)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent: record-begin: %v\n", err)
+		return 2
+	}
+	fmt.Printf("recorded %d files to %s\n", n, data_flag)
+	return 0
+}
+
+// runRecordEnd diffs the pre-run index against the current file tree, merges
+// the changed files into the manifest, and refreshes the package/service
+// snapshots. The result is the ansible inventory for the node.
+func runRecordEnd(manifest_flag, data_flag, dirs_flag string) int {
+	roots := splitCSV(dirs_flag)
+	if manifest_flag == "" || data_flag == "" || len(roots) == 0 {
+		fmt.Fprintln(os.Stderr, "agent: -record-end needs -manifest <path>, -data <index>, and -dirs <roots>")
+		return 2
+	}
+	added, removed, err := audit.RecordEnd(manifest_flag, data_flag, roots)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent: record-end: %v\n", err)
+		return 2
+	}
+	fmt.Printf("wrote %s (files added=%d removed=%d)\n", manifest_flag, added, removed)
+	return 0
+}
+
 func splitCSV(s string) []string {
 	var out []string
 	for _, part := range strings.Split(s, ",") {
@@ -313,33 +373,15 @@ func splitCSV(s string) []string {
 	return out
 }
 
-func dedupe(in []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-// runCheck runs one manifest check, emits it to OTel, and prints the verdict.
-// Exit codes: 0 = no drift, 1 = drift detected, 2 = usage/config/operational error.
-func runCheck(config_path, manifest_flag, format_flag, node_flag, otlp_flag string, remediate bool) int {
-	if format_flag != "text" && format_flag != "json" {
-		fmt.Fprintf(os.Stderr, "agent: -format must be text or json, got %q\n", format_flag)
-		return 2
-	}
-
+// resolveCheckInputs determines the manifest path, node id, and OTLP endpoint
+// for a check. With -manifest the config is optional and only fills in unset
+// node id / endpoint; without it the manifest must come from the config file.
+func resolveCheckInputs(config_path, manifest_flag, node_flag, otlp_flag string) (string, string, string, error) {
 	manifest_path := manifest_flag
 	node_id := node_flag
 	endpoint := otlp_flag
 
 	if manifest_path != "" {
-		// Flag mode: config is optional and best-effort; it only fills in
-		// node id and endpoint when the flags don't already provide them.
 		if config_path != "" {
 			if cfg, err := agentcfg.Load(config_path); err == nil {
 				if node_id == "" {
@@ -351,11 +393,9 @@ func runCheck(config_path, manifest_flag, format_flag, node_flag, otlp_flag stri
 			}
 		}
 	} else if config_path != "" {
-		// Config mode: the manifest must come from the TOML file.
 		cfg, err := agentcfg.Load(config_path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "agent: load config %q: %v\n", config_path, err)
-			return 2
+			return "", "", "", fmt.Errorf("load config %q: %w", config_path, err)
 		}
 		manifest_path = cfg.ManifestPath
 		if node_id == "" {
@@ -367,7 +407,22 @@ func runCheck(config_path, manifest_flag, format_flag, node_flag, otlp_flag stri
 	}
 
 	if manifest_path == "" {
-		fmt.Fprintln(os.Stderr, "agent: no manifest to check (use -manifest or set manifest_path in config)")
+		return "", "", "", errors.New("no manifest to check (use -manifest or set manifest_path in config)")
+	}
+	return manifest_path, node_id, endpoint, nil
+}
+
+// runCheck runs one manifest check, emits it to OTel, and prints the verdict.
+// Exit codes: 0 = no drift, 1 = drift detected, 2 = usage/config/operational error.
+func runCheck(config_path, manifest_flag, format_flag, node_flag, otlp_flag string, remediate bool) int {
+	if format_flag != "text" && format_flag != "json" {
+		fmt.Fprintf(os.Stderr, "agent: -format must be text or json, got %q\n", format_flag)
+		return 2
+	}
+
+	manifest_path, node_id, endpoint, err := resolveCheckInputs(config_path, manifest_flag, node_flag, otlp_flag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "agent:", err)
 		return 2
 	}
 	node_id = resolveNodeID(node_id, "")
@@ -446,12 +501,12 @@ func emitOTel(result audit.CheckResult, endpoint, node_id string) {
 
 	otel, shutdown, err := agentotel.Setup(ctx, otlpEndpoint(endpoint, ""), node_id)
 	if err != nil {
-		log.Printf("agent: otel setup: %v", err)
+		slog.Warn("agent: otel setup", "err", err.Error())
 		return
 	}
 	otel.EmitCheck(ctx, result)
 	if err := shutdown(ctx); err != nil {
-		log.Printf("agent: otel shutdown: %v", err)
+		slog.Warn("agent: otel shutdown", "err", err.Error())
 	}
 }
 

@@ -13,7 +13,7 @@ func TestCheckLocalClean(t *testing.T) {
 	if err := os.WriteFile(fpath, content, 0644); err != nil {
 		t.Fatalf("write watched file: %v", err)
 	}
-	mpath := writeManifest(t, dir, Manifest{
+	mpath := writeTestManifest(t, dir, Manifest{
 		SchemaVersion: 1,
 		GeneratedAt:   9999999999,
 		Files:         []ManifestFile{{Path: fpath, SHA256: sha256Hex(content)}},
@@ -34,7 +34,7 @@ func TestCheckLocalDrift(t *testing.T) {
 	if err := os.WriteFile(fpath, []byte("v1"), 0644); err != nil {
 		t.Fatalf("write watched file: %v", err)
 	}
-	mpath := writeManifest(t, dir, Manifest{
+	mpath := writeTestManifest(t, dir, Manifest{
 		SchemaVersion: 1,
 		Files:         []ManifestFile{{Path: fpath, SHA256: sha256Hex([]byte("v1"))}},
 	})
@@ -66,7 +66,7 @@ func TestCheckLocalMissingManifest(t *testing.T) {
 
 func TestLoadFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	mpath := writeManifest(t, dir, Manifest{SchemaVersion: 1, GeneratedAt: 42})
+	mpath := writeTestManifest(t, dir, Manifest{SchemaVersion: 1, GeneratedAt: 42})
 	m, err := LoadFile(mpath)
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
